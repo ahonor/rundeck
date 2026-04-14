@@ -26,6 +26,7 @@ package com.dtolabs.rundeck.core.execution.workflow.steps;
 import com.dtolabs.rundeck.core.execution.ExceptionStatusResult;
 import com.dtolabs.rundeck.core.execution.workflow.DataOutput;
 import com.dtolabs.rundeck.core.execution.workflow.OutputContext;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest;
 
 import java.util.Map;
 
@@ -41,4 +42,28 @@ public interface StepExecutionResult extends ExceptionStatusResult {
     public FailureReason getFailureReason();
     public String getFailureMessage();
 
+    /**
+     * Whether this result represents a suspended step. When {@code true}, the
+     * engine's result aggregation loop MUST treat it as a suspension signal,
+     * NOT as a failure, even though {@link #isSuccess()} returns {@code false}.
+     *
+     * <p>The check must be performed BEFORE inspecting {@link #isSuccess()} or
+     * {@link #getFailureReason()}. Default returns {@code false}, so existing
+     * implementations are unchanged.
+     *
+     * <p>See spec section 2.1 and section 6.1 in
+     * {@code docs/specs/workflow-suspend-resume.md}.
+     */
+    default boolean isSuspended() {
+        return false;
+    }
+
+    /**
+     * Returns the {@link SuspendRequest} carried by this result if
+     * {@link #isSuspended()} is {@code true}, otherwise {@code null}. Default
+     * returns {@code null} so existing implementations are unchanged.
+     */
+    default SuspendRequest getSuspendRequest() {
+        return null;
+    }
 }
