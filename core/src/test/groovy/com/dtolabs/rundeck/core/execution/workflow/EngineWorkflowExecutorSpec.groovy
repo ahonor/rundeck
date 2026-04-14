@@ -29,6 +29,8 @@ import com.dtolabs.rundeck.core.execution.workflow.steps.StepExecutionResult
 import com.dtolabs.rundeck.core.execution.workflow.steps.StepExecutionResultImpl
 import com.dtolabs.rundeck.core.execution.workflow.steps.StepExecutor
 import com.dtolabs.rundeck.core.execution.workflow.steps.StepFailureReason
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendedStepResult
 import com.dtolabs.rundeck.core.execution.workflow.steps.node.NodeStepExecutor
 import com.dtolabs.rundeck.core.plugins.configuration.Validator
 import com.dtolabs.rundeck.core.rules.Condition
@@ -908,6 +910,213 @@ class EngineWorkflowExecutorSpec extends Specification {
         !result.success
         result.stepFailures
         result.stepFailures.size() == 1
+    }
+
+    // ----------------------------------------------------------------------
+    // Wave 1 suspend/resume tests (cycle/workflow-suspend-resume)
+    // Spec: docs/specs/workflow-suspend-resume.md §6.1
+    // ----------------------------------------------------------------------
+
+    def "suspended step result causes workflow to end with isSuspended=true"() {
+        given:
+            def engine = new EngineWorkflowExecutor(framework)
+            def suspendRequest = SuspendRequest.builder()
+                    .token('test-token-suspend')
+                    .timeoutMs(60_000L)
+                    .reason('awaiting confirmation in test')
+                    .waitingFor('user-confirmation')
+                    .build()
+            def suspendedResult = new SuspendedStepResult(suspendRequest)
+
+            // Step 1 succeeds, step 2 suspends, step 3 should NEVER be invoked
+            // because the engine loop exits after observing the suspended state.
+            def callCount = [step1: 0, step2: 0, step3: 0]
+            serviceSupport.executionService = Mock(ExecutionService) {
+                executeStep(_, _) >> { args ->
+                    def ctx = args[0]
+                    def stepNum = ctx.getStepNumber()
+                    if (stepNum == 1) {
+                        callCount.step1++
+                        return Mock(StepExecutionResult) {
+                            isSuccess() >> true
+                            isSuspended() >> false
+                        }
+                    }
+                    if (stepNum == 2) {
+                        callCount.step2++
+                        return suspendedResult
+                    }
+                    callCount.step3++
+                    return Mock(StepExecutionResult) {
+                        isSuccess() >> true
+                        isSuspended() >> false
+                    }
+                }
+            }
+            framework.getWorkflowStrategyService().registerClass('test-strategy-suspend', TestWorkflowStrategy)
+
+            def context = Mock(StepExecutionContext) {
+                _ * getStepNumber() >> 1
+                _ * getExecutionListener() >> Mock(ExecutionListener) {
+                    createOverride() >> Mock(ExecutionListenerOverride)
+                }
+                _ * getNodes() >> Mock(INodeSet) {
+                    _ * getNodes() >> { [new NodeEntryImpl('set1node1')] }
+                }
+                _ * getWorkflowExecutionListener() >> new NoopWorkflowExecutionListener()
+                _ * getFrameworkProject() >> PROJECT_NAME
+                _ * getFramework() >> framework
+                _ * componentForType(_) >> Optional.empty()
+                _ * componentsForType(_) >> []
+                _ * useSingleComponentOfType(_) >> Optional.empty()
+            }
+            def item = Mock(WorkflowExecutionItem) {
+                getWorkflow() >> Mock(IWorkflow) {
+                    getCommands() >> [
+                            Mock(StepExecutionItem) { getType() >> 'blah' },
+                            Mock(StepExecutionItem) { getType() >> 'blah' },
+                            Mock(StepExecutionItem) { getType() >> 'blah' }
+                    ]
+                    getStrategy() >> 'test-strategy-suspend'
+                }
+            }
+
+        when:
+            def result = engine.executeWorkflowImpl(context, item)
+
+        then:
+            result != null
+            result.isSuspended()
+            !result.isSuccess()
+            result.getSuspendRequests().size() == 1
+            result.getSuspendRequests()[0].token == 'test-token-suspend'
+            result.getSuspendRequests()[0].reason == 'awaiting confirmation in test'
+            // stepFailures must NOT contain the suspended step
+            result.getStepFailures().isEmpty()
+            // Step 1 and step 2 were invoked; step 3 was NOT
+            callCount.step1 == 1
+            callCount.step2 == 1
+            callCount.step3 == 0
+    }
+
+    def "suspended workflow result is distinct from failed workflow result"() {
+        given:
+            def engine = new EngineWorkflowExecutor(framework)
+            def suspendRequest = SuspendRequest.builder()
+                    .token('distinct-test')
+                    .timeoutMs(1000L)
+                    .reason('distinguish from failure')
+                    .build()
+
+            serviceSupport.executionService = Mock(ExecutionService) {
+                1 * executeStep(_, _) >> new SuspendedStepResult(suspendRequest)
+            }
+            framework.getWorkflowStrategyService().registerClass('test-strategy-distinct', TestWorkflowStrategy)
+
+            def context = Mock(StepExecutionContext) {
+                _ * getExecutionListener() >> Mock(ExecutionListener) {
+                    createOverride() >> Mock(ExecutionListenerOverride)
+                }
+                _ * getNodes() >> Mock(INodeSet) {
+                    _ * getNodes() >> { [new NodeEntryImpl('set1node1')] }
+                }
+                _ * getWorkflowExecutionListener() >> new NoopWorkflowExecutionListener()
+                _ * getFrameworkProject() >> PROJECT_NAME
+                _ * getFramework() >> framework
+                _ * componentForType(_) >> Optional.empty()
+                _ * componentsForType(_) >> []
+                _ * useSingleComponentOfType(_) >> Optional.empty()
+            }
+            def item = Mock(WorkflowExecutionItem) {
+                getWorkflow() >> Mock(IWorkflow) {
+                    getCommands() >> [
+                            Mock(StepExecutionItem) { getType() >> 'blah' }
+                    ]
+                    getStrategy() >> 'test-strategy-distinct'
+                }
+            }
+
+        when:
+            def result = engine.executeWorkflowImpl(context, item)
+
+        then:
+            result != null
+            result.isSuspended()
+            !result.isSuccess()
+            // No step-level failures recorded for a suspension
+            result.getStepFailures().isEmpty()
+            // Result set contains exactly the suspended step
+            result.getResultSet().size() == 1
+            result.getResultSet()[0].isSuspended()
+    }
+
+    def "finishWorkflowExecution listener NOT fired on suspended result"() {
+        given:
+            def engine = new EngineWorkflowExecutor(framework)
+            def suspendRequest = SuspendRequest.builder()
+                    .token('listener-test')
+                    .timeoutMs(1000L)
+                    .reason('listener suppression test')
+                    .build()
+
+            serviceSupport.executionService = Mock(ExecutionService) {
+                1 * executeStep(_, _) >> new SuspendedStepResult(suspendRequest)
+            }
+            framework.getWorkflowStrategyService().registerClass('test-strategy-listener', TestWorkflowStrategy)
+
+            // A listener that counts begin/finish invocations. executeWorkflow
+            // (not executeWorkflowImpl) is the entry point that invokes the
+            // listener's finishWorkflowExecution; spec §6.1 requires that it
+            // be SUPPRESSED when the result isSuspended() == true.
+            def beginCount = 0
+            def finishCount = 0
+            def countingListener = new NoopWorkflowExecutionListener() {
+                @Override
+                void beginWorkflowExecution(StepExecutionContext ec, WorkflowExecutionItem wi) {
+                    beginCount++
+                }
+
+                @Override
+                void finishWorkflowExecution(
+                        WorkflowExecutionResult r, StepExecutionContext ec, WorkflowExecutionItem wi) {
+                    finishCount++
+                }
+            }
+
+            def context = Mock(StepExecutionContext) {
+                _ * getExecutionListener() >> Mock(ExecutionListener) {
+                    createOverride() >> Mock(ExecutionListenerOverride)
+                }
+                _ * getNodes() >> Mock(INodeSet) {
+                    _ * getNodes() >> { [new NodeEntryImpl('set1node1')] }
+                }
+                _ * getWorkflowExecutionListener() >> countingListener
+                _ * getFrameworkProject() >> PROJECT_NAME
+                _ * getFramework() >> framework
+                _ * componentForType(_) >> Optional.empty()
+                _ * componentsForType(_) >> []
+                _ * useSingleComponentOfType(_) >> Optional.empty()
+            }
+            def item = Mock(WorkflowExecutionItem) {
+                getWorkflow() >> Mock(IWorkflow) {
+                    getCommands() >> [
+                            Mock(StepExecutionItem) { getType() >> 'blah' }
+                    ]
+                    getStrategy() >> 'test-strategy-listener'
+                }
+            }
+
+        when:
+            // Drive the full executeWorkflow path so the listener is wired.
+            def result = engine.executeWorkflow(context, item)
+
+        then:
+            result != null
+            result.isSuspended()
+            // begin fires as normal
+            beginCount == 1
+            // finish MUST NOT fire on suspended result
+            finishCount == 0
     }
 
     def "default augmentor initial state should not include shared data in state"(){

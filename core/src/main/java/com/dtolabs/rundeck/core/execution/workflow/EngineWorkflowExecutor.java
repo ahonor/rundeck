@@ -31,6 +31,7 @@ import com.dtolabs.rundeck.core.execution.workflow.steps.StepException;
 import com.dtolabs.rundeck.core.execution.workflow.steps.StepExecutionResult;
 import com.dtolabs.rundeck.core.execution.workflow.steps.StepExecutionResultImpl;
 import com.dtolabs.rundeck.core.execution.workflow.steps.StepFailureReason;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest;
 import com.dtolabs.rundeck.core.rules.*;
 import com.dtolabs.rundeck.plugins.ServiceNameConstants;
 import com.google.common.base.Throwables;
@@ -62,6 +63,13 @@ public class EngineWorkflowExecutor extends BaseWorkflowExecutor {
     public static final String STEP_ANY_STATE_SKIPPED_KEY = "step.any.state.skipped";
     public static final String STEP_ANY_STATE_SUCCESS_KEY = "step.any.state.success";
     public static final String STEP_ANY_STATE_FAILED_KEY = "step.any.state.failed";
+    /** Suspend/resume: set to {@code "true"} on any step whose result has
+     *  {@code isSuspended() == true}. Triggers the suspended-end-workflow
+     *  rule, causing the engine processor loop to exit with the suspended
+     *  step's result in accumulated results. See spec §6.1. */
+    public static final String STEP_ANY_STATE_SUSPENDED_KEY = "step.any.state.suspended";
+    /** Per-step suspended marker: {@code step.<n>.suspended = "true"}. */
+    public static final String STEP_SUSPENDED_KEY = "step.#.suspended";
     public static final String STEP_COMPLETED_KEY = "step.#.completed";
     public static final String VALUE_TRUE = Boolean.TRUE.toString();
     private static final Rule FLOW_CONTROL_HALT_END_WORKFLOW = Rules.conditionsRule(
@@ -85,17 +93,33 @@ public class EngineWorkflowExecutor extends BaseWorkflowExecutor {
             ),
             Workflows.getWorkflowEndState()
     );
+    /**
+     * Suspend/resume: when any step's result is suspended, end the workflow
+     * at the next processor loop iteration. Keeps the suspended step's
+     * result in the accumulated {@code operationResults}; the aggregation
+     * loop in {@code executeWorkflowImpl} then builds a suspended
+     * {@link WorkflowExecutionResult}. See spec §6.1.
+     */
+    private static final Rule STEP_SUSPENDED_END_WORKFLOW = Rules.conditionsRule(
+            Rules.equalsCondition(
+                    STEP_ANY_STATE_SUSPENDED_KEY,
+                    VALUE_TRUE
+            ),
+            Workflows.getWorkflowEndState()
+    );
     private static final Set<Rule> INITIAL_RULES = Collections.unmodifiableSet(
             new HashSet<>(
                     Arrays.asList(
                             FLOW_CONTROL_HALT_END_WORKFLOW,
-                            STEP_FAILURE_KEEPGOING_FALSE_END_WORKFLOW
+                            STEP_FAILURE_KEEPGOING_FALSE_END_WORKFLOW,
+                            STEP_SUSPENDED_END_WORKFLOW
                     )
             )
     );
     public static final String STEP_STATE_RESULT_SUCCESS = "success";
     public static final String STEP_STATE_RESULT_FAILURE = "failure";
     public static final String STEP_STATE_RESULT_SKIPPED = "skipped";
+    public static final String STEP_STATE_RESULT_SUSPENDED = "suspended";
     public static final String STEP_CONTROL_KEY = "step.#.start";
     public static final String STEP_CONTROL_SKIP_KEY = "step.#.skip";
     public static final String STEP_CONTROL_START = "start";
@@ -202,6 +226,9 @@ public class EngineWorkflowExecutor extends BaseWorkflowExecutor {
         final IWorkflow workflow = item.getWorkflow();
         final Map<Integer, StepExecutionResult> stepFailures = new HashMap<>();
         final List<StepExecutionResult> stepResults = new ArrayList<>();
+        // Suspend/resume: collected when one or more steps return a suspended
+        // result. Populated in the result aggregation loop below.
+        final List<SuspendRequest> suspendRequests = new ArrayList<>();
 
 
         WorkflowStrategy strategyForWorkflow;
@@ -277,11 +304,24 @@ public class EngineWorkflowExecutor extends BaseWorkflowExecutor {
 
                 if (completed != null) {
                     StepResultCapture result = completed.getStepResultCapture();
-                    if (!result.getStepResult().isSuccess()) {
-                        stepFailures.put(completed.getStepNum(), result.getStepResult());
+                    StepExecutionResult stepResult = result.getStepResult();
+                    // Suspend/resume: check isSuspended() BEFORE isSuccess().
+                    // A suspended step is neither a success nor a failure;
+                    // it is a third state. Do NOT add it to stepFailures.
+                    // See spec §6.1 and invariant I4.
+                    if (stepResult != null && stepResult.isSuspended()) {
+                        if (stepResult.getSuspendRequest() != null) {
+                            suspendRequests.add(stepResult.getSuspendRequest());
+                        }
+                        stepResults.add(stepResult);
                         workflowSuccess = false;
+                    } else {
+                        if (!stepResult.isSuccess()) {
+                            stepFailures.put(completed.getStepNum(), stepResult);
+                            workflowSuccess = false;
+                        }
+                        stepResults.add(stepResult);
                     }
-                    stepResults.add(result.getStepResult());
                     if (result.getControlBehavior() != null && result.getControlBehavior() != ControlBehavior.Continue) {
                         controlBehavior = result.getControlBehavior();
                         statusString = result.getStatusString();
@@ -327,6 +367,22 @@ public class EngineWorkflowExecutor extends BaseWorkflowExecutor {
         final Exception fexception = exception;
 
         final Map<String, Collection<StepExecutionResult>> nodeFailures = convertFailures(stepFailures);
+        // Suspend/resume: when any step suspended, return a suspended
+        // WorkflowExecutionResult carrying the collected SuspendRequests.
+        // The workflow is neither successful nor failed; it is parked at a
+        // step boundary. See spec §6.1 in docs/specs/workflow-suspend-resume.md.
+        if (!suspendRequests.isEmpty()) {
+            return new BaseWorkflowExecutionResult(
+                    stepResults,
+                    nodeFailures,
+                    stepFailures,
+                    fexception,
+                    workflowResult,
+                    sharedContext,
+                    true,
+                    suspendRequests
+            );
+        }
         return new BaseWorkflowExecutionResult(
                 stepResults,
                 nodeFailures,

@@ -36,9 +36,11 @@ import com.dtolabs.rundeck.core.execution.workflow.steps.*;
 import com.dtolabs.rundeck.core.execution.workflow.steps.node.NodeStepException;
 import com.dtolabs.rundeck.core.execution.workflow.steps.node.NodeStepResult;
 import com.dtolabs.rundeck.core.execution.workflow.steps.node.NodeStepResultImpl;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -145,6 +147,8 @@ public abstract class BaseWorkflowExecutor implements WorkflowExecutor {
         private final Map<String, Collection<StepExecutionResult>> failures;
         private final Map<Integer, StepExecutionResult> stepFailures;
         private final Exception orig;
+        private final boolean suspended;
+        private final List<SuspendRequest> suspendRequests;
 
         public BaseWorkflowExecutionResult(
                 List<StepExecutionResult> results,
@@ -155,11 +159,35 @@ public abstract class BaseWorkflowExecutor implements WorkflowExecutor {
                 WFSharedContext sharedContext
         )
         {
+            this(results, failures, stepFailures, orig, status, sharedContext, false, Collections.emptyList());
+        }
+
+        /**
+         * Constructor variant that carries workflow suspend state. Used by
+         * the engine's result aggregation loop when any step returned a
+         * suspended {@link StepExecutionResult}. See spec section 6.1 and
+         * invariants I4, I7 in {@code docs/specs/workflow-suspend-resume.md}.
+         */
+        public BaseWorkflowExecutionResult(
+                List<StepExecutionResult> results,
+                Map<String, Collection<StepExecutionResult>> failures,
+                final Map<Integer, StepExecutionResult> stepFailures,
+                Exception orig,
+                final WorkflowStatusResult status,
+                WFSharedContext sharedContext,
+                boolean suspended,
+                List<SuspendRequest> suspendRequests
+        )
+        {
             super(status, sharedContext);
             this.results = results;
             this.failures = failures;
             this.stepFailures = stepFailures;
             this.orig = orig;
+            this.suspended = suspended;
+            this.suspendRequests = suspendRequests == null
+                    ? Collections.emptyList()
+                    : Collections.unmodifiableList(new ArrayList<>(suspendRequests));
         }
 
         public List<StepExecutionResult> getResultSet() {
@@ -173,6 +201,16 @@ public abstract class BaseWorkflowExecutor implements WorkflowExecutor {
 
         public Exception getException() {
             return orig;
+        }
+
+        @Override
+        public boolean isSuspended() {
+            return suspended;
+        }
+
+        @Override
+        public List<SuspendRequest> getSuspendRequests() {
+            return suspendRequests;
         }
 
         @Override
@@ -193,9 +231,12 @@ public abstract class BaseWorkflowExecutor implements WorkflowExecutor {
                              getControlBehavior()
                            : "");
             builder.append(", status: ");
-            String success = isSuccess() ? "succeeded" : "failed";
+            String success = suspended ? "suspended" : (isSuccess() ? "succeeded" : "failed");
             String status = null != getStatusString() ? getStatusString() : success;
             builder.append(status);
+            if (suspended) {
+                builder.append(", suspendRequests: ").append(suspendRequests.size());
+            }
             builder.append("]");
             return builder.toString();
         }
@@ -220,7 +261,14 @@ public abstract class BaseWorkflowExecutor implements WorkflowExecutor {
             result = executeWorkflowImpl(executionContext, item);
         } finally {
             if (null != wlistener && !BaseWorkflowExecutor.isInnerLoop(item)) {
-                wlistener.finishWorkflowExecution(result, executionContext, item);
+                // Suspend/resume: suppress finishWorkflowExecution when the
+                // workflow is suspended. The workflow has parked at a step
+                // boundary and will resume later; it has not ended. Terminal
+                // listener events fire from the node that performs the true
+                // terminal write (invariant I4, spec §6.1).
+                if (result == null || !result.isSuspended()) {
+                    wlistener.finishWorkflowExecution(result, executionContext, item);
+                }
             }
         }
         return result;
