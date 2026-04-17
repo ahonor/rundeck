@@ -16,6 +16,7 @@
 package com.dtolabs.rundeck.core.execution.workflow.suspend;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonSubTypes;
 import com.fasterxml.jackson.annotation.JsonTypeInfo;
 
 import java.io.Serializable;
@@ -44,6 +45,13 @@ import java.io.Serializable;
         include = JsonTypeInfo.As.PROPERTY,
         property = "type"
 )
+@JsonSubTypes({
+        // Built-in subtypes registered at compile time. Third-party plugins
+        // register additional subtypes via JacksonSubtypeRegistrar Spring
+        // beans (spec §12 decision 16, §14 Q5 resolved as Approach 2 with
+        // Approach 3 fallback for built-in types).
+        @JsonSubTypes.Type(value = ConfirmationPayload.class, name = "confirmation")
+})
 public interface ResumePayload extends Serializable {
     /**
      * Discriminator used by Jackson polymorphic deserialization to resolve

@@ -121,5 +121,6 @@ databaseChangeLog = {
         include file: 'core/ExecutionIndexes.groovy'
         include file: 'core/WorkflowJsonStorage.groovy'
         include file: 'core/SuspendResume-6.0.groovy'
+        include file: 'core/ExecutionConfirmation-6.0.groovy'
 
 }
