@@ -131,7 +131,7 @@ databaseChangeLog = {
         createIndex(indexName: "EXECUTION_WAITING_CLAIM_IDX", tableName: "execution") {
             column(name: "status")
             column(name: "resume_ready")
-            column(name: "server_node_uuid")
+            column(name: "server_nodeuuid")
         }
     }
 
