@@ -15,10 +15,12 @@
  */
 package rundeck.controllers
 
+import com.dtolabs.rundeck.core.authorization.AuthContext
 import com.dtolabs.rundeck.core.execution.workflow.suspend.ConfirmationPayload
 import com.fasterxml.jackson.databind.ObjectMapper
 import groovy.util.logging.Slf4j
 import org.rundeck.core.auth.AuthConstants
+import org.rundeck.app.authorization.AppAuthContextProcessor
 import rundeck.Execution
 import rundeck.ExecutionConfirmation
 import rundeck.services.ExecutionResumeService
@@ -42,6 +44,7 @@ class ApiConfirmController {
 
     ExecutionService executionService
     ExecutionResumeService executionResumeService
+    AppAuthContextProcessor rundeckAuthContextProcessor
 
     private final ObjectMapper objectMapper = new ObjectMapper()
 
@@ -88,15 +91,15 @@ class ApiConfirmController {
             return
         }
 
-        // TODO: Check 'confirm' ACL action authorization
-        // For Wave 5 minimum viable, the ACL check is a placeholder.
-        // Full enforcement requires wiring into the Rundeck auth framework
-        // which is complex and CI-validated.
-        // if (!rundeckAuthContextProcessor.authorizeProjectExecutionAll(authContext, execution, [AuthConstants.ACTION_CONFIRM])) {
-        //     response.status = 403
-        //     render([error: 'not authorized to confirm this execution'] as grails.converters.JSON)
-        //     return
-        // }
+        // ACL enforcement: caller must have 'confirm' action on the execution.
+        AuthContext authContext = rundeckAuthContextProcessor.getAuthContextForSubjectAndProject(
+                session.subject, execution.project)
+        if (!rundeckAuthContextProcessor.authorizeProjectExecutionAll(
+                authContext, execution, [AuthConstants.ACTION_CONFIRM])) {
+            response.status = 403
+            render([error: 'not authorized to confirm this execution'] as grails.converters.JSON)
+            return
+        }
 
         // Parse request body
         def body = request.JSON
@@ -181,6 +184,17 @@ class ApiConfirmController {
         boolean isWaitingConfirmation = execution.status == ExecutionService.EXECUTION_WAITING &&
                 metadata.get('type') == 'confirmation'
 
+        // Check if caller has confirm ACL for this execution
+        boolean callerCanConfirm = false
+        try {
+            AuthContext authContext = rundeckAuthContextProcessor.getAuthContextForSubjectAndProject(
+                    session.subject, execution.project)
+            callerCanConfirm = rundeckAuthContextProcessor.authorizeProjectExecutionAll(
+                    authContext, execution, [AuthConstants.ACTION_CONFIRM])
+        } catch (Exception ignored) {
+            // If auth check fails, default to false
+        }
+
         render([
                 waiting: isWaitingConfirmation,
                 currentStatus: execution.status,
@@ -189,7 +203,7 @@ class ApiConfirmController {
                 requiredConfirmerRoles: metadata.get('requiredConfirmerRoles'),
                 waitStartedAt: execution.waitStartedAt?.toInstant()?.toString(),
                 waitTimeoutAt: execution.waitTimeoutAt?.toInstant()?.toString(),
-                callerCanConfirm: true  // TODO: check ACL
+                callerCanConfirm: callerCanConfirm
         ] as grails.converters.JSON)
     }
 

@@ -3201,7 +3201,28 @@ class ExecutionService implements ApplicationContextAware, StepExecutor, NodeSte
             e.save(flush: true)
             log.info("Execution ${execId} suspended at step ${suspendedStepIndex + 1} (timeout at ${timeoutAt ?: 'never'})")
         }
-        return Execution.get(execId)
+
+        // Fire notification event AFTER the DB transaction commits (spec §4
+        // I5 step 7). The notification trigger type matches the suspend
+        // metadata type: 'waiting' for generic suspensions, or a more
+        // specific name if the metadata specifies one (e.g., for future
+        // consumer plugins). Job definitions can configure 'onwaiting'
+        // notifications to subscribe.
+        def execution = Execution.get(execId)
+        if (execution?.scheduledExecution) {
+            try {
+                String notifTrigger = 'waiting'
+                notificationService.asyncTriggerJobNotification(
+                        notifTrigger,
+                        execution.scheduledExecution.uuid,
+                        [execution: execution]
+                )
+                log.debug("Fired '${notifTrigger}' notification for execution ${execId}")
+            } catch (Exception notifEx) {
+                log.warn("Failed to fire waiting notification for execution ${execId}: ${notifEx.message}")
+            }
+        }
+        return execution
     }
 
     /**
