@@ -1224,6 +1224,24 @@ class ExecutionService implements ApplicationContextAware, StepExecutor, NodeSte
                     .workflowExecutionListener(multiListener)
                     .build()
 
+            // Wave 6: wire the pauseCheckSupplier so the engine's
+            // StepCallable can detect operator-pause requests from the DB
+            // between step invocations. The supplier reads pause_requested
+            // from the Execution row on each call.
+            if (executioncontext instanceof ExecutionContextImpl) {
+                final long execId = execution.id
+                ((ExecutionContextImpl) executioncontext).setPauseCheckSupplier({
+                    try {
+                        return Execution.withNewSession {
+                            Execution e = Execution.get(execId)
+                            return e?.pauseRequested ?: false
+                        }
+                    } catch (Exception ex) {
+                        return false
+                    }
+                })
+            }
+
             fileUploadService.executionBeforeStart(
                     new ExecutionPrepareEvent(
                             execution: execution,

@@ -42,6 +42,13 @@ class UrlMappings {
         }
         "/api/$api_version/execution/$id/state"(controller: 'execution', action: 'apiExecutionState')
         "/api/$api_version/execution/$id/abort"(controller: 'execution', action: 'apiExecutionAbort')
+        // Wave 5+6 cycle/workflow-suspend-resume: confirmation + operator-pause endpoints
+        "/api/$api_version/execution/$id/confirm"(controller: 'apiConfirm', action: 'confirm')
+        "/api/$api_version/execution/$id/confirm/status"(controller: 'apiConfirm', action: 'confirmStatus')
+        "/api/$api_version/execution/$id/confirmations"(controller: 'apiConfirm', action: 'confirmations')
+        "/api/$api_version/execution/$id/pause"(controller: 'apiOperatorPause', action: 'pause')
+        "/api/$api_version/execution/$id/pause/status"(controller: 'apiOperatorPause', action: 'pauseStatus')
+        "/api/$api_version/execution/$id/resume"(controller: 'apiOperatorPause', action: 'resume')
         "/api/$api_version/execution/$id/input/files"(controller: 'execution', action: 'apiExecutionInputFiles')
         "/api/$api_version/execution/$id/output(.$format)?"(controller: 'execution', action: 'apiExecutionOutput')
         "/api/$api_version/execution/$id/output/state"(controller: 'execution', action: 'apiExecutionStateOutput')
