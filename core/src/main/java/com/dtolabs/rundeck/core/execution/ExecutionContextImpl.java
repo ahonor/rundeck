@@ -30,7 +30,12 @@ import com.dtolabs.rundeck.core.data.*;
 import com.dtolabs.rundeck.core.dispatcher.*;
 import com.dtolabs.rundeck.core.execution.component.ContextComponent;
 import com.dtolabs.rundeck.core.execution.workflow.*;
+import com.dtolabs.rundeck.core.execution.workflow.steps.StepExecutionResult;
 import com.dtolabs.rundeck.core.execution.workflow.steps.node.NodeExecutionContext;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendedStepResult;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspensionNotAllowedException;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspensionPolicy;
 import com.dtolabs.rundeck.core.jobs.JobService;
 import com.dtolabs.rundeck.core.logging.LoggingManager;
 import com.dtolabs.rundeck.core.nodes.ProjectNodeService;
@@ -183,6 +188,29 @@ public class ExecutionContextImpl implements ExecutionContext, StepExecutionCont
     @Override
     public FlowControl getFlowControl() {
         return flowControl;
+    }
+
+    /**
+     * Wave 2 suspend/resume (spec §5.1, §12 decision 9): the plugin-facing
+     * entry point for requesting a workflow suspension. Validates the
+     * checkpointability of this context's components via
+     * {@link SuspensionPolicy#validateComponents(List)} and, on success,
+     * returns a {@link SuspendedStepResult} that carries the request back to
+     * the engine's aggregation loop (see Wave 1:
+     * {@code EngineWorkflowExecutor.executeWorkflowImpl}).
+     *
+     * <p>Additional policy checks (parallel-strategy rejection, sub-workflow
+     * rejection, non-checkpointable log writer rejection) are layered on in
+     * subsequent waves as the required collaborators become available at
+     * suspend-call time.
+     */
+    @Override
+    public StepExecutionResult suspend(SuspendRequest request) throws SuspensionNotAllowedException {
+        if (request == null) {
+            throw new SuspensionNotAllowedException("SuspendRequest must not be null");
+        }
+        SuspensionPolicy.validateComponents(getComponentList());
+        return new SuspendedStepResult(request);
     }
 
     @Override

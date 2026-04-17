@@ -79,6 +79,74 @@ class ExecutionUtilService {
         finishExecutionMetrics(execMap)
         finishExecutionLogging(execMap)
     }
+
+    /**
+     * Wave 2 cycle/workflow-suspend-resume: tear down the thread-bound I/O
+     * and close the log writer WITHOUT firing a terminal footer, so the
+     * log file remains in a state equivalent to an in-progress execution
+     * that a future resume can reopen in append mode. See spec §4 I5 and
+     * §5.2 for the ordering contract.
+     *
+     * <p>This is the suspend-path analogue of
+     * {@link #finishExecutionLogging(ExecutionService.AsyncStarted)}. It
+     * deliberately skips the execution-XML file generation and the normal
+     * log messages that would describe a completed execution, because the
+     * execution is not completed — it is parked.
+     *
+     * <p>Wave 3 strengthens the {@code suspend()} path with an explicit
+     * fsync and a resume-mode reopen. For Wave 2 the minimum viable
+     * behavior is flush + close without footer.
+     */
+    @CompileStatic
+    def suspendExecution(ExecutionService.AsyncStarted execMap) {
+        try {
+            sysThreadBoundOut.removeThreadStream()?.close()
+        } catch (Throwable t) {
+            log.warn("Could not remove thread-bound stdout on suspend: ${t.message}")
+        }
+        try {
+            sysThreadBoundErr.removeThreadStream()?.close()
+        } catch (Throwable t) {
+            log.warn("Could not remove thread-bound stderr on suspend: ${t.message}")
+        }
+        ExecutionLogWriter loghandler = execMap?.loghandler
+        if (loghandler != null) {
+            // The ExecutionLogWriter wraps a delegate StreamingLogWriter via
+            // FilterStreamingLogWriter. Walk any filter chain to find the
+            // underlying writer that supports the suspend SPI; if none is
+            // found, fall back to plain close (which writes the footer,
+            // accepted as a v1 fallback when a third-party writer plugin
+            // does not opt in).
+            com.dtolabs.rundeck.core.logging.StreamingLogWriter current = loghandler
+            boolean suspended = false
+            int depth = 0
+            while (current != null && depth < 16) {
+                if (current instanceof com.dtolabs.rundeck.core.execution.workflow.suspend.CheckpointableStreamingLogWriter) {
+                    try {
+                        ((com.dtolabs.rundeck.core.execution.workflow.suspend.CheckpointableStreamingLogWriter) current).suspend()
+                        suspended = true
+                    } catch (Throwable t) {
+                        log.error("Failed to suspend log writer ${current.class.name}: ${t.message}", t)
+                    }
+                    break
+                }
+                if (current instanceof com.dtolabs.rundeck.core.logging.FilterStreamingLogWriter) {
+                    current = ((com.dtolabs.rundeck.core.logging.FilterStreamingLogWriter) current).getWriter()
+                } else {
+                    break
+                }
+                depth++
+            }
+            if (!suspended) {
+                log.warn("No CheckpointableStreamingLogWriter found in log writer chain; closing normally (footer will be written)")
+                try {
+                    loghandler.close()
+                } catch (Throwable t) {
+                    log.error("Failed to close log writer on suspend fallback: ${t.message}", t)
+                }
+            }
+        }
+    }
     @CompileStatic
     def  finishExecutionMetrics(ExecutionService.AsyncStarted execMap) {
         def ServiceThreadBase thread = execMap.thread

@@ -16,6 +16,7 @@
 
 package com.dtolabs.rundeck.app.internal.logging
 
+import com.dtolabs.rundeck.core.execution.workflow.suspend.CheckpointableStreamingLogWriter
 import com.dtolabs.rundeck.core.logging.LogEvent
 import com.dtolabs.rundeck.core.logging.StreamingLogWriter
 import com.dtolabs.rundeck.core.logging.internal.DefaultLogEvent
@@ -24,7 +25,7 @@ import com.dtolabs.rundeck.core.logging.internal.OutputLogFormat
 /**
  * Logs to a file using the OutputLogFormat
  */
-class FSStreamingLogWriter implements StreamingLogWriter {
+class FSStreamingLogWriter implements StreamingLogWriter, CheckpointableStreamingLogWriter {
     static final String lineSep = "\n"
     private OutputStream output
     private Map<String, String> defaultMeta
@@ -88,6 +89,28 @@ class FSStreamingLogWriter implements StreamingLogWriter {
                 output.close()
                 output = null
                 //generate stacktrace to record source of close()
+                closer = new Exception()
+            }
+        }
+    }
+
+    /**
+     * Wave 2 suspend/resume stub: flush and close the underlying stream
+     * WITHOUT writing the terminal {@code ^END^} footer. Wave 3 hardens this
+     * implementation with an explicit {@code fsync} and adds a resume-mode
+     * constructor flag that suppresses {@code outputBegin()} on reopen so
+     * the appended content does not produce a second header.
+     *
+     * <p>See spec §5.2 and cycle manifest Wave 2/3 notes.
+     */
+    @Override
+    void suspend() {
+        synchronized (this) {
+            if (null != output) {
+                // Intentionally does NOT call formatter.outputFinish().
+                output.flush()
+                output.close()
+                output = null
                 closer = new Exception()
             }
         }
