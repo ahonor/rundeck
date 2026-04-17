@@ -702,6 +702,50 @@ class LogFileStorageService
     }
 
     /**
+     * Wave 3 cycle/workflow-suspend-resume: open a log writer in resume mode
+     * for an execution whose log file was previously {@code suspend()}-closed.
+     * Opens the file in append mode ({@code FileOutputStream(file, true)})
+     * and constructs the writer with {@code resumeMode=true} so
+     * {@link FSStreamingLogWriter#openStream()} skips the format header.
+     *
+     * <p>Preconditions (spec §5.2):
+     * <ul>
+     *   <li>Any prior writer on this file has been
+     *       {@code suspend()}-closed.</li>
+     *   <li>The DB state reflects {@code serverNodeUUID} transfer to the
+     *       caller (atomic claim succeeded).</li>
+     * </ul>
+     *
+     * <p>The returned writer behaves identically to a normal writer for the
+     * remainder of the execution: its {@code close()} writes the terminal
+     * footer. See spec §5.2 and cycle manifest Wave 3.
+     *
+     * @param e the execution whose log file should be reopened
+     * @param defaultMeta metadata to apply to log events (same as original)
+     * @return a writer ready to receive events for the remainder of the
+     *         execution
+     */
+    StreamingLogWriter getLogFileWriterForResume(
+            Execution e,
+            Map<String, String> defaultMeta
+    ) {
+        def filetype = LoggingService.LOG_FILE_FILETYPE
+        File file = getFileForExecutionFiletype(e, filetype, false, false)
+        if (!file.exists()) {
+            throw new IllegalStateException(
+                    "Log file does not exist for resume: ${file.absolutePath} (execution ${e.id})")
+        }
+        // Append mode: does NOT truncate the existing file.
+        def writer = new FSStreamingLogWriter(
+                new FileOutputStream(file, true),
+                defaultMeta,
+                rundeckLogFormat,
+                true  // resumeMode: skip header on openStream()
+        )
+        return writer
+    }
+
+    /**
      * @param execution
      * @return
      */

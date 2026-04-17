@@ -32,6 +32,13 @@ class FSStreamingLogWriter implements StreamingLogWriter, CheckpointableStreamin
     private OutputLogFormat formatter
     private boolean started
     private volatile long bytesWritten
+    /**
+     * Wave 3 cycle/workflow-suspend-resume: when true, {@link #openStream()}
+     * skips writing the {@code ^text/x-rundeck-log-v2.0^} header so that
+     * appending to an existing log file does not produce a second header.
+     * Used by {@code LogFileStorageService.getLogFileWriterForResume()}.
+     */
+    private boolean resumeMode
 
     public long getBytesWritten(){
         return bytesWritten
@@ -46,9 +53,22 @@ class FSStreamingLogWriter implements StreamingLogWriter, CheckpointableStreamin
      */
     public FSStreamingLogWriter(OutputStream output, Map<String, String> defaultMeta,
                                 OutputLogFormat formatter) {
+        this(output, defaultMeta, formatter, false)
+    }
+
+    /**
+     * Wave 3 cycle/workflow-suspend-resume: create a writer with an optional
+     * resume-mode flag. When {@code resumeMode} is {@code true},
+     * {@link #openStream()} does NOT write the format header — the caller
+     * has opened the stream in append mode on an existing file that already
+     * has a header from its original open. See spec §5.2.
+     */
+    public FSStreamingLogWriter(OutputStream output, Map<String, String> defaultMeta,
+                                OutputLogFormat formatter, boolean resumeMode) {
         this.output = output
         this.defaultMeta = defaultMeta
         this.formatter = formatter
+        this.resumeMode = resumeMode
         started = false
         bytesWritten = 0
     }
@@ -61,8 +81,13 @@ class FSStreamingLogWriter implements StreamingLogWriter, CheckpointableStreamin
     void openStream() throws IOException{
         synchronized (this) {
             if (!started) {
-                write(formatter.outputBegin())
-                write(lineSep)
+                // Wave 3 cycle/workflow-suspend-resume: in resume mode the
+                // file already has a header from its original open; writing
+                // a second one would corrupt the format. See spec §5.2.
+                if (!resumeMode) {
+                    write(formatter.outputBegin())
+                    write(lineSep)
+                }
                 started = true
             }
         }
@@ -103,12 +128,27 @@ class FSStreamingLogWriter implements StreamingLogWriter, CheckpointableStreamin
      *
      * <p>See spec §5.2 and cycle manifest Wave 2/3 notes.
      */
+    /**
+     * Wave 3 cycle/workflow-suspend-resume: flush buffered events, fsync
+     * kernel buffers to disk, and close the underlying stream WITHOUT writing
+     * the terminal {@code ^END^} footer. The file remains in a state
+     * indistinguishable from an in-progress execution; a subsequent
+     * {@code openForResume} call can reopen it in append mode.
+     *
+     * <p>Spec §5.2 contract: MUST fsync before returning. A plain
+     * {@code flush()} is insufficient — crashed processes may lose
+     * kernel-buffered writes that flush reported as successful.
+     */
     @Override
     void suspend() {
         synchronized (this) {
             if (null != output) {
                 // Intentionally does NOT call formatter.outputFinish().
                 output.flush()
+                // fsync: force kernel buffers to disk (spec §5.2 contract).
+                if (output instanceof FileOutputStream) {
+                    ((FileOutputStream) output).getFD().sync()
+                }
                 output.close()
                 output = null
                 closer = new Exception()
