@@ -104,6 +104,16 @@ public class ExecutionContextImpl implements ExecutionContext, StepExecutionCont
      * DB column. Populated on resume; empty map on first invocation.
      */
     private Map<String, Object> suspendMetadata;
+    /**
+     * Set by {@link #suspend(SuspendRequest)} so that
+     * {@link com.dtolabs.rundeck.core.execution.workflow.steps.StepPluginAdapter}
+     * can detect a pending suspension after the void-returning
+     * {@code StepPlugin.executeStep()} returns. Without this field, the
+     * adapter has no way to distinguish "step completed successfully" from
+     * "step requested suspension" because both paths exit executeStep()
+     * without an exception.
+     */
+    private volatile SuspendedStepResult pendingSuspension;
 
     private ExecutionContextImpl() {
         stepContext = new ArrayList<>();
@@ -233,7 +243,23 @@ public class ExecutionContextImpl implements ExecutionContext, StepExecutionCont
             throw new SuspensionNotAllowedException("SuspendRequest must not be null");
         }
         SuspensionPolicy.validateComponents(getComponentList());
-        return new SuspendedStepResult(request);
+        SuspendedStepResult result = new SuspendedStepResult(request);
+        // Store the suspension so StepPluginAdapter can detect it after
+        // the void-returning StepPlugin.executeStep() completes.
+        this.pendingSuspension = result;
+        return result;
+    }
+
+    /**
+     * Returns the pending suspension set by {@link #suspend(SuspendRequest)},
+     * or {@code null} if no suspension was requested during this step's
+     * execution. Called by
+     * {@link com.dtolabs.rundeck.core.execution.workflow.steps.StepPluginAdapter}
+     * after {@code StepPlugin.executeStep()} returns to bridge the
+     * void-returning interface.
+     */
+    public SuspendedStepResult getPendingSuspension() {
+        return pendingSuspension;
     }
 
     @Override

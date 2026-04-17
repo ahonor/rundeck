@@ -27,6 +27,7 @@ import com.dtolabs.rundeck.core.Constants;
 import com.dtolabs.rundeck.core.data.SharedDataContextUtils;
 import com.dtolabs.rundeck.core.dispatcher.ContextView;
 import com.dtolabs.rundeck.core.execution.ConfiguredStepExecutionItem;
+import com.dtolabs.rundeck.core.execution.ExecutionContextImpl;
 import com.dtolabs.rundeck.core.execution.StepExecutionItem;
 import com.dtolabs.rundeck.core.execution.workflow.StepExecutionContext;
 import com.dtolabs.rundeck.core.plugins.configuration.*;
@@ -139,6 +140,20 @@ public class StepPluginAdapter implements StepExecutor, Describable, DynamicProp
                     "Failed executing step plugin [" + providerName + "]: "
                             + stringWriter.toString());
             return new StepExecutionResultImpl(e, StepFailureReason.PluginFailed, e.getMessage());
+        }
+        // Suspend/resume: check if the plugin called context.suspend()
+        // during its executeStep(). StepPlugin.executeStep is void-returning,
+        // so a suspension signal can only be communicated via a side-channel
+        // on the execution context. ExecutionContextImpl.suspend() stores a
+        // SuspendedStepResult in pendingSuspension; if present, return it
+        // instead of the default success result. See spec §5.1 and the
+        // StepPluginAdapter void-return gap documented in Wave 5.
+        if (executionContext instanceof ExecutionContextImpl) {
+            com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendedStepResult pending =
+                    ((ExecutionContextImpl) executionContext).getPendingSuspension();
+            if (pending != null) {
+                return pending;
+            }
         }
         return new StepExecutionResultImpl();
     }

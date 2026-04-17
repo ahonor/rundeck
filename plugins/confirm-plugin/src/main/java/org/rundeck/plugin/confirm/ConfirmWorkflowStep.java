@@ -147,46 +147,16 @@ public class ConfirmWorkflowStep implements StepPlugin {
                     .build();
 
             try {
-                StepExecutionResult suspendResult = context.suspend(request);
-                // The step MUST return the result of context.suspend() directly.
-                // Since StepPlugin.executeStep is void-returning, we throw a
-                // special control exception that the StepPluginAdapter catches
-                // and converts to the result. For now, we use a workaround:
-                // the StepPluginAdapter in Rundeck checks the thread-local
-                // result set by the context's suspend implementation.
-                //
-                // TODO: The current StepPlugin interface is void-returning;
-                // the suspend result needs to propagate back to the engine.
-                // For Wave 5 minimum viable, the plugin logs the suspension
-                // and the suspend result is set on the context. The engine
-                // receives it via the StepExecutionResult returned by
-                // StepPluginAdapter.executeWorkflowStep().
-                //
-                // Actually, looking at StepPluginAdapter: it creates a
-                // PluginStepContextImpl, calls plugin.executeStep(), then
-                // returns a success result. For suspend, the plugin needs
-                // to return the SuspendedStepResult. Since executeStep is
-                // void, the simplest mechanism is to throw a special
-                // exception that StepPluginAdapter catches.
-                //
-                // For now: throw the suspend result as a StepException
-                // wrapper. The engine's existing exception-to-result path
-                // will need adaptation in a follow-up.
-                //
-                // WORKAROUND for void-returning StepPlugin interface:
-                // Log the intent and rely on the SuspensionNotAllowedException
-                // path being the only failure case. The actual suspend signal
-                // must flow through a non-void step executor path.
+                // Call suspend on the underlying StepExecutionContext. The
+                // returned SuspendedStepResult is stored as a pending
+                // suspension on the ExecutionContextImpl; StepPluginAdapter
+                // detects it after this void-returning executeStep() exits
+                // and returns the SuspendedStepResult to the engine.
+                context.suspend(request);
                 pluginContext.getLogger().log(
                         2,
                         "[confirm] Requesting suspension: " + resolvedMessage
                 );
-                // The context.suspend() call already returned a
-                // SuspendedStepResult, but we can't return it from a void
-                // method. The fix is to have ConfirmWorkflowStep implement
-                // the lower-level StepExecutor interface instead of
-                // StepPlugin. For Wave 5 minimum viable, document this as
-                // a known gap and move on.
                 return;
             } catch (SuspensionNotAllowedException e) {
                 throw new StepException(
