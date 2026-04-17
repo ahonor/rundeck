@@ -50,7 +50,8 @@ import java.io.Serializable;
         // register additional subtypes via JacksonSubtypeRegistrar Spring
         // beans (spec §12 decision 16, §14 Q5 resolved as Approach 2 with
         // Approach 3 fallback for built-in types).
-        @JsonSubTypes.Type(value = ConfirmationPayload.class, name = "confirmation")
+        @JsonSubTypes.Type(value = ConfirmationPayload.class, name = "confirmation"),
+        @JsonSubTypes.Type(value = OperatorResumePayload.class, name = "operator-resume")
 })
 public interface ResumePayload extends Serializable {
     /**

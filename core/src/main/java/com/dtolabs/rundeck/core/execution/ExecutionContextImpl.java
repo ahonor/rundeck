@@ -94,6 +94,13 @@ public class ExecutionContextImpl implements ExecutionContext, StepExecutionCont
     
     private ExecutionReference execution;
     /**
+     * Wave 6: transient supplier that returns true if the operator has
+     * requested a pause via the API. Checked by StepCallable before each
+     * step invocation. Set by the Grails layer (ExecutionService) at
+     * execution start time; reads from the DB on each call.
+     */
+    private transient java.util.function.Supplier<Boolean> pauseCheckSupplier;
+    /**
      * Wave 4 cycle/workflow-suspend-resume: resume payload delivered by the
      * event that ended the suspension. Only non-null during a resume
      * invocation of a previously suspended step. See spec §5.1.
@@ -262,6 +269,18 @@ public class ExecutionContextImpl implements ExecutionContext, StepExecutionCont
         return pendingSuspension;
     }
 
+    /**
+     * Wave 6: check if operator has requested a pause. Returns false if
+     * no pause supplier is configured (normal execution path).
+     */
+    public boolean isPauseRequested() {
+        return pauseCheckSupplier != null && Boolean.TRUE.equals(pauseCheckSupplier.get());
+    }
+
+    public void setPauseCheckSupplier(java.util.function.Supplier<Boolean> supplier) {
+        this.pauseCheckSupplier = supplier;
+    }
+
     @Override
     public String getCharsetEncoding() {
         return charsetEncoding;
@@ -344,6 +363,11 @@ public class ExecutionContextImpl implements ExecutionContext, StepExecutionCont
                     StepExecutionContext sec = (StepExecutionContext) original;
                     ctx.resumePayload = sec.getResumePayload();
                     ctx.suspendMetadata = sec.getSuspendMetadata();
+                }
+                // Wave 6: carry the pause-check supplier through to per-step
+                // contexts so StepCallable can check it.
+                if (original instanceof ExecutionContextImpl) {
+                    ctx.pauseCheckSupplier = ((ExecutionContextImpl) original).pauseCheckSupplier;
                 }
             }
         }
