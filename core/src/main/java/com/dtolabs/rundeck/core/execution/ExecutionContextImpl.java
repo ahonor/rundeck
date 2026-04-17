@@ -32,6 +32,7 @@ import com.dtolabs.rundeck.core.execution.component.ContextComponent;
 import com.dtolabs.rundeck.core.execution.workflow.*;
 import com.dtolabs.rundeck.core.execution.workflow.steps.StepExecutionResult;
 import com.dtolabs.rundeck.core.execution.workflow.steps.node.NodeExecutionContext;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.ResumePayload;
 import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest;
 import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendedStepResult;
 import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspensionNotAllowedException;
@@ -92,6 +93,17 @@ public class ExecutionContextImpl implements ExecutionContext, StepExecutionCont
     @Getter private WorkflowData workflowData;
     
     private ExecutionReference execution;
+    /**
+     * Wave 4 cycle/workflow-suspend-resume: resume payload delivered by the
+     * event that ended the suspension. Only non-null during a resume
+     * invocation of a previously suspended step. See spec §5.1.
+     */
+    private ResumePayload resumePayload;
+    /**
+     * Wave 4: frozen suspend metadata from the Execution.suspend_metadata
+     * DB column. Populated on resume; empty map on first invocation.
+     */
+    private Map<String, Object> suspendMetadata;
 
     private ExecutionContextImpl() {
         stepContext = new ArrayList<>();
@@ -101,6 +113,7 @@ public class ExecutionContextImpl implements ExecutionContext, StepExecutionCont
         sharedDataContext = new WFSharedContext();
         outputContext = SharedDataContextUtils.outputContext(ContextView.global());
         componentList = new ArrayList<>();
+        suspendMetadata = Collections.emptyMap();
     }
 
     public static Builder builder() {
@@ -188,6 +201,16 @@ public class ExecutionContextImpl implements ExecutionContext, StepExecutionCont
     @Override
     public FlowControl getFlowControl() {
         return flowControl;
+    }
+
+    @Override
+    public ResumePayload getResumePayload() {
+        return resumePayload;
+    }
+
+    @Override
+    public Map<String, Object> getSuspendMetadata() {
+        return suspendMetadata != null ? suspendMetadata : Collections.emptyMap();
     }
 
     /**
@@ -289,6 +312,13 @@ public class ExecutionContextImpl implements ExecutionContext, StepExecutionCont
                     ctx.componentList.addAll(original.getComponentList());
                 }
                 ctx.workflowData = original.getWorkflowData();
+                // Wave 4: copy resume payload + suspend metadata so per-step
+                // contexts inherit them from the base execution context.
+                if (original instanceof StepExecutionContext) {
+                    StepExecutionContext sec = (StepExecutionContext) original;
+                    ctx.resumePayload = sec.getResumePayload();
+                    ctx.suspendMetadata = sec.getSuspendMetadata();
+                }
             }
         }
 
@@ -591,6 +621,27 @@ public class ExecutionContextImpl implements ExecutionContext, StepExecutionCont
 
         public Builder framework(IFramework framework) {
             ctx.framework = framework;
+            return this;
+        }
+
+        /**
+         * Wave 4 cycle/workflow-suspend-resume: set the resume payload that
+         * the suspended step plugin will read via
+         * {@link StepExecutionContext#getResumePayload()}.
+         */
+        public Builder resumePayload(ResumePayload resumePayload) {
+            ctx.resumePayload = resumePayload;
+            return this;
+        }
+
+        /**
+         * Wave 4: set the frozen suspend metadata that the step plugin reads
+         * via {@link StepExecutionContext#getSuspendMetadata()}.
+         */
+        public Builder suspendMetadata(Map<String, Object> suspendMetadata) {
+            ctx.suspendMetadata = suspendMetadata != null
+                    ? Collections.unmodifiableMap(new HashMap<>(suspendMetadata))
+                    : Collections.emptyMap();
             return this;
         }
 
