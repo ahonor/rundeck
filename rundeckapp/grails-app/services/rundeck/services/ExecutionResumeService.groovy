@@ -15,11 +15,30 @@
  */
 package rundeck.services
 
+import com.dtolabs.rundeck.core.common.IFramework
+import com.dtolabs.rundeck.core.common.NodeSetImpl
+import com.dtolabs.rundeck.core.execution.ExecutionContextImpl
+import com.dtolabs.rundeck.core.execution.WorkflowExecutionServiceThread
+import com.dtolabs.rundeck.core.execution.workflow.EngineWorkflowExecutor
+import com.dtolabs.rundeck.core.execution.workflow.NoopWorkflowExecutionListener
+import com.dtolabs.rundeck.core.execution.workflow.StepExecutionContext
+import com.dtolabs.rundeck.core.execution.workflow.WFSharedContext
+import com.dtolabs.rundeck.core.execution.workflow.WorkflowExecutionItem
+import com.dtolabs.rundeck.core.execution.workflow.WorkflowExecutionResult
+import com.dtolabs.rundeck.core.execution.workflow.suspend.ExecutionCheckpoint
 import com.dtolabs.rundeck.core.execution.workflow.suspend.ResumePayload
+import com.dtolabs.rundeck.core.dispatcher.ContextView
+import com.dtolabs.rundeck.core.logging.LogLevel
+import com.dtolabs.rundeck.core.logging.internal.RundeckLogFormat
+import com.dtolabs.rundeck.app.internal.logging.FSStreamingLogWriter
+import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
 import groovy.util.logging.Slf4j
+import org.rundeck.app.authorization.AppAuthContextProcessor
 import org.springframework.scheduling.annotation.Scheduled
 import rundeck.Execution
+import rundeck.ScheduledExecution
+import rundeck.services.logging.ExecutionLogWriter
 
 /**
  * Wave 4 cycle/workflow-suspend-resume: polling worker that resumes
@@ -50,8 +69,10 @@ class ExecutionResumeService {
     LogFileStorageService logFileStorageService
     FrameworkService frameworkService
     LoggingService loggingService
+    AppAuthContextProcessor rundeckAuthContextProcessor
 
     private final ObjectMapper objectMapper = new ObjectMapper()
+            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
 
     /**
      * Polling worker. Tick interval from config property
@@ -161,21 +182,179 @@ class ExecutionResumeService {
      * tested end-to-end; the full resume path is layered on iteratively.
      */
     void resumeExecution(Execution execution) {
-        log.info("Resuming execution ${execution.id} from checkpoint " +
-                 "(suspendedAt step ${execution.checkpointData ? 'present' : 'absent'})")
-        // TODO Wave 4 full: rehydrate context, reopen log, spawn thread,
-        // enter executeWorkflowResume. For now, log and mark as placeholder.
-        // Full implementation requires:
-        // 1. Parse checkpoint_data JSON → ExecutionCheckpoint
-        // 2. Parse resume_payload JSON → ResumePayload (polymorphic)
-        // 3. Parse suspend_metadata JSON → Map
-        // 4. Rebuild ExecutionContextImpl from checkpoint + local framework
-        //    (mirrors executeAsyncBegin context-build pattern)
-        // 5. Open log writer via logFileStorageService.getLogFileWriterForResume
-        // 6. Create WorkflowExecutionServiceThread
-        // 7. Call EngineWorkflowExecutor.executeWorkflowResume
-        // 8. On completion: call saveExecutionState (terminal write)
-        // 9. On failure: release claim + increment resume_attempt_count
+        log.info("Resuming execution ${execution.id} from checkpoint")
+
+        // 1. Parse checkpoint
+        ExecutionCheckpoint checkpoint
+        try {
+            checkpoint = objectMapper.readValue(execution.checkpointData, ExecutionCheckpoint)
+        } catch (Exception e) {
+            log.error("Failed to parse checkpoint for execution ${execution.id}: ${e.message}")
+            releaseClaim(execution.id)
+            return
+        }
+        if (checkpoint.version != ExecutionCheckpoint.CURRENT_VERSION) {
+            log.error("Unsupported checkpoint version ${checkpoint.version} for execution ${execution.id}")
+            // Don't retry — version mismatch is permanent
+            Execution.withNewTransaction {
+                Execution ex = Execution.get(execution.id)
+                ex.status = ExecutionService.EXECUTION_FAILED
+                ex.dateCompleted = new Date()
+                ex.save(flush: true)
+            }
+            return
+        }
+
+        // 2. Parse resume payload (polymorphic)
+        ResumePayload payload = null
+        if (execution.resumePayload) {
+            try {
+                payload = objectMapper.readValue(execution.resumePayload, ResumePayload)
+            } catch (Exception e) {
+                log.warn("Failed to parse resume payload for execution ${execution.id}: ${e.message}; using raw map")
+                // Fallback: the step plugin will receive a null payload
+            }
+        }
+
+        // 3. Parse suspend metadata
+        Map<String, Object> metadata = [:]
+        if (execution.suspendMetadata) {
+            try {
+                metadata = objectMapper.readValue(execution.suspendMetadata, Map)
+            } catch (Exception e) {
+                log.warn("Failed to parse suspend metadata for execution ${execution.id}: ${e.message}")
+            }
+        }
+
+        // 4. Rebuild auth context from frozen user + roles (Wave 0 verification:
+        // BaseAuthContextProvider.getAuthContextForUserAndRoles)
+        def authContext = rundeckAuthContextProcessor.getAuthContextForUserAndRoles(
+                execution.user, execution.userRoles ?: [])
+
+        // 5. Get framework
+        IFramework framework = frameworkService.rundeckFramework
+
+        // 6. Reopen log writer in resume mode (Wave 3: append, no header)
+        def defaultMeta = [user: execution.user, node: framework.frameworkNodeName]
+        def logWriter
+        try {
+            logWriter = logFileStorageService.getLogFileWriterForResume(execution, defaultMeta)
+            logWriter.openStream()
+        } catch (Exception e) {
+            log.error("Failed to reopen log writer for execution ${execution.id}: ${e.message}", e)
+            releaseClaim(execution.id)
+            return
+        }
+        def loghandler = new ExecutionLogWriter(logWriter)
+
+        // 7. Build execution context (simplified vs executeAsyncBegin — no
+        //    ContextManager, no log filter plugins, no thread-bound streams;
+        //    sufficient for the engine to re-invoke the suspended step and
+        //    run remaining steps).
+        def project = execution.project
+        def noopListener = new NoopWorkflowExecutionListener()
+        StepExecutionContext executionContext = ExecutionContextImpl.builder()
+                .frameworkProject(project)
+                .user(execution.user)
+                .framework(framework)
+                .authContext(authContext)
+                .storageTree(frameworkService.storageTree)
+                .nodeService(frameworkService.rundeckNodeService)
+                .nodes(new NodeSetImpl())
+                .executionListener(noopListener)
+                .workflowExecutionListener(noopListener)
+                .resumePayload(payload)
+                .suspendMetadata(metadata)
+                .stepNumber(1)
+                .build()
+
+        // 8. Build workflow item from execution's workflow
+        WorkflowExecutionItem item = executionUtilService.createExecutionItemForWorkflow(
+                execution.workflowData)
+
+        // 9. Get the engine executor and call executeWorkflowResume
+        def engineExecutor = (EngineWorkflowExecutor) framework
+                .getWorkflowExecutionService()
+                .getExecutorForItem(item)
+
+        log.info("Entering executeWorkflowResume for execution ${execution.id} " +
+                 "at suspended step index ${checkpoint.suspendedStepIndex}")
+
+        WorkflowExecutionResult result
+        try {
+            result = engineExecutor.executeWorkflowResume(
+                    executionContext, item, checkpoint, payload, metadata)
+        } catch (Throwable t) {
+            log.error("executeWorkflowResume failed for execution ${execution.id}: ${t.message}", t)
+            loghandler.logError("Resume failed: ${t.message}")
+            loghandler.close()
+            releaseClaim(execution.id)
+            return
+        } finally {
+            // Close the log writer (writes ^END^ footer on normal path)
+            if (result != null && !result.isSuspended()) {
+                try {
+                    loghandler.close()
+                } catch (Throwable t) {
+                    log.warn("Failed to close log writer for execution ${execution.id}: ${t.message}")
+                }
+            } else if (result != null && result.isSuspended()) {
+                // Re-suspended: suspend-close (no footer)
+                try {
+                    executionUtilService.suspendExecution(
+                            new ExecutionService.AsyncStarted(
+                                    loghandler: loghandler,
+                                    execution: execution))
+                } catch (Throwable t) {
+                    log.warn("Failed to suspend-close log writer: ${t.message}")
+                }
+            }
+        }
+
+        // 10. Handle terminal result
+        if (result.isSuspended()) {
+            // Re-suspended: persist the new suspension state
+            executionService.onWorkflowSuspended(
+                    new ExecutionService.AsyncStarted(
+                            loghandler: loghandler,
+                            execution: execution),
+                    result)
+            log.info("Execution ${execution.id} re-suspended at step ${result.suspendRequests?.size() ?: 0}")
+        } else {
+            // Terminal: write completion state
+            def scheduledExecution = execution.scheduledExecution
+            def statusString = result.isSuccess() ? 'true' : 'false'
+            def dateCompleted = new Date()
+            executionService.saveExecutionState(
+                    scheduledExecution?.uuid,
+                    execution.id,
+                    [
+                            status       : statusString,
+                            dateCompleted: dateCompleted,
+                            cancelled    : false,
+                            timedOut     : false,
+                    ],
+                    null,
+                    null
+            )
+            // Clear suspend-related columns per I11
+            Execution.withNewTransaction {
+                Execution ex = Execution.get(execution.id)
+                if (ex) {
+                    ex.checkpointData = null
+                    ex.suspendMetadata = null
+                    ex.waitStartedAt = null
+                    ex.waitTimeoutAt = null
+                    ex.lastResumedAt = null
+                    ex.resumeReady = false
+                    ex.resumePayload = null
+                    ex.resumeAttemptCount = 0
+                    ex.pauseRequested = false
+                    ex.save(flush: true)
+                }
+            }
+            log.info("Execution ${execution.id} resumed and completed with success=${result.isSuccess()}")
+        }
     }
 
     /**
