@@ -20,7 +20,9 @@ import com.dtolabs.rundeck.core.common.NodeSetImpl
 import com.dtolabs.rundeck.core.execution.ExecutionContextImpl
 import com.dtolabs.rundeck.core.execution.WorkflowExecutionServiceThread
 import com.dtolabs.rundeck.core.execution.workflow.EngineWorkflowExecutor
+import com.dtolabs.rundeck.core.execution.workflow.WorkflowExecutionListenerImpl
 import com.dtolabs.rundeck.core.execution.workflow.NoopWorkflowExecutionListener
+import com.dtolabs.rundeck.core.logging.LogUtil
 import com.dtolabs.rundeck.core.execution.workflow.StepExecutionContext
 import com.dtolabs.rundeck.core.execution.workflow.WFSharedContext
 import com.dtolabs.rundeck.core.execution.workflow.WorkflowExecutionItem
@@ -70,6 +72,8 @@ class ExecutionResumeService {
     FrameworkService frameworkService
     LoggingService loggingService
     AppAuthContextProcessor rundeckAuthContextProcessor
+    def storageService
+    def rundeckNodeService
 
     private final ObjectMapper objectMapper = new ObjectMapper()
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
@@ -83,10 +87,7 @@ class ExecutionResumeService {
      * (1 affected row), calls {@link #resumeExecution(Execution)}. On
      * zero affected rows (race lost), skips.
      */
-    // Note: @Scheduled requires Spring scheduling to be enabled in the
-    // Grails application context. If it's not enabled, this method is a
-    // no-op until configuration is added. For Wave 4 minimum viable,
-    // this method can also be invoked programmatically for testing.
+    @Scheduled(fixedDelayString = '${rundeck.execution.resume.pollIntervalMs:2000}')
     void scheduledResumePoll() {
         if (!frameworkService) {
             return // not yet initialized
@@ -181,27 +182,41 @@ class ExecutionResumeService {
      * user+roles). This placeholder enables the polling worker to be
      * tested end-to-end; the full resume path is layered on iteratively.
      */
-    void resumeExecution(Execution execution) {
-        log.info("Resuming execution ${execution.id} from checkpoint")
+    void resumeExecution(Execution executionRef) {
+        def execId = executionRef.id
+        log.info("Resuming execution ${execId} from checkpoint")
+
+        // Wrap the ENTIRE resume path in a single Hibernate session so
+        // all lazy proxies (ScheduledExecution, Workflow, plugin configs)
+        // resolve consistently. Multiple separate sessions cause
+        // LazyInitializationException when objects from one session are
+        // accessed in another.
+        Execution.withNewSession { session ->
+
+        Execution execution = Execution.get(execId)
+        if (!execution) {
+            log.error("resumeExecution: execution ${execId} not found")
+            releaseClaim(execId)
+            return
+        }
+        // Force Hibernate to re-read the row from the DB to sync the
+        // version field after the raw SQL UPDATE in attemptClaim.
+        execution.refresh()
 
         // 1. Parse checkpoint
         ExecutionCheckpoint checkpoint
         try {
             checkpoint = objectMapper.readValue(execution.checkpointData, ExecutionCheckpoint)
         } catch (Exception e) {
-            log.error("Failed to parse checkpoint for execution ${execution.id}: ${e.message}")
-            releaseClaim(execution.id)
+            log.error("Failed to parse checkpoint for execution ${execId}: ${e.message}")
+            releaseClaim(execId)
             return
         }
         if (checkpoint.version != ExecutionCheckpoint.CURRENT_VERSION) {
-            log.error("Unsupported checkpoint version ${checkpoint.version} for execution ${execution.id}")
-            // Don't retry — version mismatch is permanent
-            Execution.withNewTransaction {
-                Execution ex = Execution.get(execution.id)
-                ex.status = ExecutionService.EXECUTION_FAILED
-                ex.dateCompleted = new Date()
-                ex.save(flush: true)
-            }
+            log.error("Unsupported checkpoint version ${checkpoint.version} for execution ${execId}")
+            execution.status = ExecutionService.EXECUTION_FAILED
+            execution.dateCompleted = new Date()
+            execution.save(flush: true)
             return
         }
 
@@ -211,8 +226,7 @@ class ExecutionResumeService {
             try {
                 payload = objectMapper.readValue(execution.resumePayload, ResumePayload)
             } catch (Exception e) {
-                log.warn("Failed to parse resume payload for execution ${execution.id}: ${e.message}; using raw map")
-                // Fallback: the step plugin will receive a null payload
+                log.warn("Failed to parse resume payload for execution ${execId}: ${e.message}; using raw map")
             }
         }
 
@@ -222,62 +236,83 @@ class ExecutionResumeService {
             try {
                 metadata = objectMapper.readValue(execution.suspendMetadata, Map)
             } catch (Exception e) {
-                log.warn("Failed to parse suspend metadata for execution ${execution.id}: ${e.message}")
+                log.warn("Failed to parse suspend metadata for execution ${execId}: ${e.message}")
             }
         }
 
-        // 4. Rebuild auth context from frozen user + roles (Wave 0 verification:
-        // BaseAuthContextProvider.getAuthContextForUserAndRoles)
+        // 4. Rebuild auth context
         def authContext = rundeckAuthContextProcessor.getAuthContextForUserAndRoles(
                 execution.user, execution.userRoles ?: [])
 
         // 5. Get framework
         IFramework framework = frameworkService.rundeckFramework
 
-        // 6. Reopen log writer in resume mode (Wave 3: append, no header)
+        // 6. Reopen log writer in resume mode
         def defaultMeta = [user: execution.user, node: framework.frameworkNodeName]
         def logWriter
         try {
             logWriter = logFileStorageService.getLogFileWriterForResume(execution, defaultMeta)
             logWriter.openStream()
         } catch (Exception e) {
-            log.error("Failed to reopen log writer for execution ${execution.id}: ${e.message}", e)
-            releaseClaim(execution.id)
+            log.error("Failed to reopen log writer for execution ${execId}: ${e.message}", e)
+            releaseClaim(execId)
             return
         }
         def loghandler = new ExecutionLogWriter(logWriter)
 
-        // 7. Build execution context (simplified vs executeAsyncBegin — no
-        //    ContextManager, no log filter plugins, no thread-bound streams;
-        //    sufficient for the engine to re-invoke the suspended step and
-        //    run remaining steps).
+        // 7. Build execution context
         def project = execution.project
-        def noopListener = new NoopWorkflowExecutionListener()
+        // Use the real WorkflowExecutionListenerImpl with a proper logger.
+        // This is the same class used by executeAsyncBegin. It properly
+        // implements createOverride(), setFailedNodesListener(), and all
+        // the listener contracts that downstream node dispatch requires.
+        def resumeLogger = new com.dtolabs.rundeck.core.execution.ExecutionLogger() {
+            void log(int level, String message) { log.info("[resume-exec] $message") }
+            void log(int level, String message, Map meta) { log.info("[resume-exec] $message") }
+            void event(String eventType, String message, Map meta) {}
+        }
+        def executionListener = new WorkflowExecutionListenerImpl(null, resumeLogger)
+
+        def localNodeName = framework.frameworkNodeName
+        def localNode = new com.dtolabs.rundeck.core.common.NodeEntryImpl(localNodeName)
+        def nodeSet = new NodeSetImpl()
+        nodeSet.putNode(localNode)
+
+        def jobId = execution.scheduledExecution?.extid ?: ""
+        def jobName = execution.scheduledExecution?.jobName ?: "adhoc"
+
         StepExecutionContext executionContext = ExecutionContextImpl.builder()
                 .frameworkProject(project)
                 .user(execution.user)
                 .framework(framework)
                 .authContext(authContext)
-                .storageTree(frameworkService.storageTree)
-                .nodeService(frameworkService.rundeckNodeService)
-                .nodes(new NodeSetImpl())
-                .executionListener(noopListener)
-                .workflowExecutionListener(noopListener)
+                .storageTree(storageService.storageTreeWithContext(authContext))
+                .nodeService(rundeckNodeService)
+                .nodes(nodeSet)
+                .nodeSelector(com.dtolabs.rundeck.core.common.SelectorUtils.singleNode(localNodeName))
+                .executionListener(executionListener)
+                .workflowExecutionListener(executionListener)
+                .setContext("job", [
+                    successOnEmptyNodeFilter: "false",
+                    id: jobId,
+                    name: jobName,
+                    project: project
+                ])
                 .resumePayload(payload)
                 .suspendMetadata(metadata)
                 .stepNumber(1)
                 .build()
 
-        // 8. Build workflow item from execution's workflow
+        // 8. Build workflow item
         WorkflowExecutionItem item = executionUtilService.createExecutionItemForWorkflow(
                 execution.workflowData)
 
-        // 9. Get the engine executor and call executeWorkflowResume
+        // 9. Execute resume
         def engineExecutor = (EngineWorkflowExecutor) framework
                 .getWorkflowExecutionService()
                 .getExecutorForItem(item)
 
-        log.info("Entering executeWorkflowResume for execution ${execution.id} " +
+        log.info("Entering executeWorkflowResume for execution ${execId} " +
                  "at suspended step index ${checkpoint.suspendedStepIndex}")
 
         WorkflowExecutionResult result
@@ -285,10 +320,10 @@ class ExecutionResumeService {
             result = engineExecutor.executeWorkflowResume(
                     executionContext, item, checkpoint, payload, metadata)
         } catch (Throwable t) {
-            log.error("executeWorkflowResume failed for execution ${execution.id}: ${t.message}", t)
+            log.error("executeWorkflowResume failed for execution ${execId}: ${t.message}", t)
             loghandler.logError("Resume failed: ${t.message}")
             loghandler.close()
-            releaseClaim(execution.id)
+            releaseClaim(execId)
             return
         } finally {
             // Close the log writer (writes ^END^ footer on normal path)
@@ -296,7 +331,7 @@ class ExecutionResumeService {
                 try {
                     loghandler.close()
                 } catch (Throwable t) {
-                    log.warn("Failed to close log writer for execution ${execution.id}: ${t.message}")
+                    log.warn("Failed to close log writer for execution ${execId}: ${t.message}")
                 }
             } else if (result != null && result.isSuspended()) {
                 // Re-suspended: suspend-close (no footer)
@@ -319,42 +354,29 @@ class ExecutionResumeService {
                             loghandler: loghandler,
                             execution: execution),
                     result)
-            log.info("Execution ${execution.id} re-suspended at step ${result.suspendRequests?.size() ?: 0}")
+            log.info("Execution ${execId} re-suspended at step ${result.suspendRequests?.size() ?: 0}")
         } else {
-            // Terminal: write completion state
-            def scheduledExecution = execution.scheduledExecution
-            def statusString = result.isSuccess() ? 'true' : 'false'
-            def dateCompleted = new Date()
-            executionService.saveExecutionState(
-                    scheduledExecution?.uuid,
-                    execution.id,
-                    [
-                            status       : statusString,
-                            dateCompleted: dateCompleted,
-                            cancelled    : false,
-                            timedOut     : false,
-                    ],
-                    null,
-                    null
-            )
+            // Terminal: write completion state directly in this session
+            // (not via saveExecutionState which opens a nested transaction
+            // and causes version conflicts with our outer session).
+            execution.refresh() // sync version after engine ran
+            execution.status = result.isSuccess() ? 'true' : 'false'
+            execution.dateCompleted = new Date()
             // Clear suspend-related columns per I11
-            Execution.withNewTransaction {
-                Execution ex = Execution.get(execution.id)
-                if (ex) {
-                    ex.checkpointData = null
-                    ex.suspendMetadata = null
-                    ex.waitStartedAt = null
-                    ex.waitTimeoutAt = null
-                    ex.lastResumedAt = null
-                    ex.resumeReady = false
-                    ex.resumePayload = null
-                    ex.resumeAttemptCount = 0
-                    ex.pauseRequested = false
-                    ex.save(flush: true)
-                }
-            }
-            log.info("Execution ${execution.id} resumed and completed with success=${result.isSuccess()}")
+            execution.checkpointData = null
+            execution.suspendMetadata = null
+            execution.waitStartedAt = null
+            execution.waitTimeoutAt = null
+            execution.lastResumedAt = null
+            execution.resumeReady = false
+            execution.resumePayload = null
+            execution.resumeAttemptCount = 0
+            execution.pauseRequested = false
+            execution.save(flush: true)
+            log.info("Execution ${execId} resumed and completed with success=${result.isSuccess()}")
         }
+
+        } // end withNewSession
     }
 
     /**

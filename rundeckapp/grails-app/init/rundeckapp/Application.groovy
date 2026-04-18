@@ -128,6 +128,7 @@ import java.nio.file.Paths
     description = "JWT token authentication for OAuth/OIDC integration (Commercial/Enterprise only). Include JWT token in Authorization header with Bearer schema."
 )
 @EnableAutoConfiguration(exclude = [SecurityFilterAutoConfiguration])
+@org.springframework.scheduling.annotation.EnableScheduling
 @Slf4j
 class Application extends GrailsAutoConfiguration implements EnvironmentAware {
     static final String SYS_PROP_RUNDECK_CONFIG_INITTED = "rundeck.config.initted"
