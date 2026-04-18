@@ -5,7 +5,7 @@
     "strict": false,
     "jsx": "preserve",
     "importHelpers": true,
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "experimentalDecorators": true,
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
@@ -34,6 +34,8 @@
     "src/library/components",
     "src/library/**/*.spec.ts",
     "src/library/**/*.stories.tsx",
+    "src/app/**/*.spec.ts",
+    "src/app/**/tests/**",
     "node_modules"
   ]
 }

@@ -107,15 +107,17 @@ public class WorkflowExecutionStateListenerAdapter implements WorkflowExecutionL
 
     public void finishWorkflowExecution(WorkflowExecutionResult result, StepExecutionContext executionContext,
             WorkflowExecutionItem item) {
+        ExecutionState wfState;
+        if (null != result && result.isSuspended()) {
+            wfState = ExecutionState.WAITING;
+        } else {
+            wfState = (null != result && result.isSuccess()) ? ExecutionState.SUCCEEDED : ExecutionState.FAILED;
+        }
         List<Pair<StepContextId, INodeEntry>> currentContext = stepContext.getCurrentContextPairs();
         if (null == currentContext || currentContext.size() < 1) {
-            notifyAllWorkflowState(
-                    null != result && result.isSuccess() ? ExecutionState.SUCCEEDED : ExecutionState.FAILED,
-                    new Date(), null);
+            notifyAllWorkflowState(wfState, new Date(), null);
         }else{
-            notifyAllSubWorkflowState(createIdentifier(),
-                    null != result && result.isSuccess() ? ExecutionState.SUCCEEDED : ExecutionState.FAILED,
-                    new Date(), null);
+            notifyAllSubWorkflowState(createIdentifier(), wfState, new Date(), null);
         }
         stepContext.finishContext();
     }
@@ -148,16 +150,22 @@ public class WorkflowExecutionStateListenerAdapter implements WorkflowExecutionL
     }
 
     private String resultMessage(StepExecutionResult result) {
+        if (null != result && result.isSuspended()) {
+            return "Waiting for confirmation";
+        }
         return null!=result?result.getFailureMessage():null;
     }
 
     private ExecutionState resultState(StepExecutionResult result) {
+        if (null != result && result.isSuspended()) {
+            return ExecutionState.WAITING;
+        }
         return (null!=result && result.isSuccess()) ? ExecutionState.SUCCEEDED :
                 ExecutionState.FAILED;
     }
 
     private Map<String, Object> resultMetadata(StepExecutionResult result) {
-        if (null != result && result.isSuccess()) {
+        if (null != result && (result.isSuccess() || result.isSuspended())) {
             return null;
         }
         HashMap<String, Object> map = new HashMap<>();

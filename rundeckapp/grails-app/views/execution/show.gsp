@@ -318,6 +318,138 @@ search
                                         </span>
                                     </span>
                                 </g:if>
+
+                                %{-- Suspend/resume: confirmation UI panel. Rendered for any
+                                     non-completed execution; hidden by default and shown
+                                     dynamically by JavaScript when status becomes 'waiting'. --}%
+                                <g:if test="${null == execution.dateCompleted}">
+                                  <div id="confirm-panel" class="panel panel-warning" style="margin-top:10px; display:${execution.status == 'waiting' ? 'block' : 'none'};">
+                                    <div class="panel-heading">
+                                      <h4 class="panel-title">
+                                        <i class="glyphicon glyphicon-pause"></i>
+                                        Waiting for Confirmation
+                                      </h4>
+                                    </div>
+                                    <div class="panel-body">
+                                      <p id="confirm-message" style="font-size:1.1em; margin-bottom:15px;"></p>
+                                      <div class="form-group">
+                                        <label for="confirm-comment">Comment (optional):</label>
+                                        <input type="text" id="confirm-comment" class="form-control"
+                                               placeholder="e.g., LGTM after reviewing build logs">
+                                      </div>
+                                      <div style="margin-top:10px;">
+                                        <button id="btn-approve" class="btn btn-success btn-sm"
+                                                onclick="submitConfirmation('approve')">
+                                          <i class="glyphicon glyphicon-ok"></i> Approve
+                                        </button>
+                                        <button id="btn-deny" class="btn btn-danger btn-sm"
+                                                onclick="submitConfirmation('deny')" style="margin-left:8px;">
+                                          <i class="glyphicon glyphicon-remove"></i> Deny
+                                        </button>
+                                        <span id="confirm-status" style="margin-left:15px;"></span>
+                                      </div>
+                                    </div>
+                                  </div>
+                                  <g:jsonToken id="confirm_token" url="${request.forwardURI}"/>
+                                  <script type="text/javascript">
+                                    (function(){
+                                      var execId = ${execution.id};
+                                      var confirmUrl = '${createLink(uri:"/api/42/execution/"+execution.id+"/confirm", absolute:true)}';
+                                      var confirmStatusUrl = confirmUrl + '/status';
+                                      // Read the CSRF token directly from the embedded JSON element
+                                      var tokenData = {};
+                                      try {
+                                        var el = document.getElementById('confirm_token');
+                                        if(el) tokenData = JSON.parse(el.textContent);
+                                      } catch(e) { console.error('token parse error', e); }
+                                      console.log('CSRF token:', tokenData.TOKEN ? 'found' : 'MISSING');
+
+                                      function sendToken(xhr) {
+                                        if(tokenData.TOKEN) {
+                                          xhr.setRequestHeader('X-RUNDECK-TOKEN-KEY', tokenData.TOKEN);
+                                          xhr.setRequestHeader('X-RUNDECK-TOKEN-URI', tokenData.URI);
+                                        }
+                                      }
+
+                                      // Load confirmation message and show panel
+                                      function loadConfirmStatus() {
+                                        jQuery.ajax({
+                                          url: confirmStatusUrl,
+                                          type: 'GET',
+                                          dataType: 'json',
+                                          beforeSend: sendToken,
+                                          success: function(d) {
+                                            if(d.waiting && d.message) {
+                                              jQuery('#confirm-message').text(d.message);
+                                              jQuery('#confirm-panel').slideDown();
+                                            }
+                                          }
+                                        });
+                                      }
+
+                                      // If already waiting, load immediately
+                                      if(jQuery('#confirm-panel').css('display') !== 'none') {
+                                        loadConfirmStatus();
+                                      } else {
+                                        // Poll execution status every 2s until it becomes 'waiting' or terminal
+                                        var pollTimer = setInterval(function() {
+                                          jQuery.ajax({
+                                            url: '${createLink(uri:"/api/42/execution/"+execution.id, absolute:true)}',
+                                            type: 'GET',
+                                            dataType: 'json',
+                                            beforeSend: sendToken,
+                                            success: function(d) {
+                                              if(d.status === 'waiting') {
+                                                clearInterval(pollTimer);
+                                                loadConfirmStatus();
+                                              } else if(d.status === 'succeeded' || d.status === 'failed' || d.status === 'aborted') {
+                                                clearInterval(pollTimer);
+                                              }
+                                            }
+                                          });
+                                        }, 2000);
+                                      }
+
+                                      window.submitConfirmation = function(decision) {
+                                        var comment = jQuery('#confirm-comment').val();
+                                        jQuery('#confirm-status').text('Submitting...');
+                                        jQuery('#btn-approve').prop('disabled', true);
+                                        jQuery('#btn-deny').prop('disabled', true);
+
+                                        jQuery.ajax({
+                                          url: confirmUrl,
+                                          type: 'POST',
+                                          dataType: 'json',
+                                          contentType: 'application/json',
+                                          data: JSON.stringify({decision: decision, comment: comment}),
+                                          beforeSend: sendToken,
+                                          success: function(d) {
+                                            if(d.resumeReady) {
+                                              var pastTense = decision === 'deny' ? 'Denied' : 'Approved';
+                                              var cls = decision === 'approve' ? 'text-success' : 'text-warning';
+                                              jQuery('#confirm-status').html(
+                                                '<span class="' + cls + '"><i class="glyphicon glyphicon-ok"></i> ' +
+                                                pastTense + '! Resuming...</span>');
+                                              setTimeout(function(){ location.reload(); }, 3000);
+                                            } else {
+                                              jQuery('#confirm-status').html('<span class="text-danger">' + (d.error || d.message || 'Failed') + '</span>');
+                                              jQuery('#btn-approve').prop('disabled', false);
+                                              jQuery('#btn-deny').prop('disabled', false);
+                                            }
+                                          },
+                                          error: function(jqxhr, status, err) {
+                                            var msg = 'Unknown error';
+                                            try { msg = JSON.parse(jqxhr.responseText).error || JSON.parse(jqxhr.responseText).message; } catch(e) { msg = jqxhr.status + ': ' + jqxhr.responseText.substring(0,100); }
+                                            jQuery('#confirm-status').html('<span class="text-danger">Error: ' + msg + '</span>');
+                                            jQuery('#btn-approve').prop('disabled', false);
+                                            jQuery('#btn-deny').prop('disabled', false);
+                                          }
+                                        });
+                                      };
+                                    })();
+                                  </script>
+                                </g:if>
+
                             <g:if test="${scheduledExecution}">
                                     <g:if test="${authChecks[AuthConstants.ACTION_RUN] && g.executionMode(
                                             active: true,

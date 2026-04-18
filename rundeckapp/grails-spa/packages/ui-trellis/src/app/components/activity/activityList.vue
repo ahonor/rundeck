@@ -236,7 +236,7 @@
             v-for="exec in running.executions"
             :key="exec.id"
             class="execution link activity_row autoclickable"
-            :class="{ nowrunning: !exec.dateCompleted, [exec.status]: true }"
+            :class="{ nowrunning: !exec.dateCompleted && exec.status !== 'waiting', nowwaiting: exec.status === 'waiting', [exec.status]: true }"
             @click="autoBulkEdit(exec)"
             @click.middle="middleClickRow(exec)"
           >
@@ -251,7 +251,8 @@
                 :disabled="
                   exec.status === 'running' ||
                   exec.status === 'scheduled' ||
-                  exec.status === 'queued'
+                  exec.status === 'queued' ||
+                  exec.status === 'waiting'
                 "
                 class="_defaultInput"
                 data-testid="bulk-delete-checkbox"
@@ -261,6 +262,11 @@
               <b
                 v-if="exec.status === 'running'"
                 class="fas fa-circle-notch fa-spin text-info"
+              ></b>
+              <b
+                v-else-if="exec.status === 'waiting'"
+                class="fas fa-pause-circle text-warning"
+                title="Waiting for confirmation"
               ></b>
               <b
                 v-else-if="exec.status === 'scheduled'"
@@ -988,6 +994,9 @@ export default defineComponent({
       }
       if (status == "running") {
         return "running";
+      }
+      if (status == "waiting") {
+        return "waiting";
       }
       if (status == "queued") {
         return "queued";

@@ -5,7 +5,7 @@
     "baseUrl": ".",
     "sourceMap": true,
     "strict": true,
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "target": "esnext",
     "experimentalDecorators": true,
     "esModuleInterop": true,
