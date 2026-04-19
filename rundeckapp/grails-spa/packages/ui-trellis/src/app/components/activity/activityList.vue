@@ -266,7 +266,7 @@
               <b
                 v-else-if="exec.status === 'waiting'"
                 class="fas fa-pause-circle text-warning"
-                title="Waiting for confirmation"
+                :title="waitingLabel(exec)"
               ></b>
               <b
                 v-else-if="exec.status === 'scheduled'"
@@ -326,6 +326,13 @@
                 type="default"
                 label
                 :label-text="$t('job.execution.queued')"
+              ></progress-bar>
+              <progress-bar
+                v-else-if="exec.status === 'waiting'"
+                :model-value="100"
+                type="warning"
+                label
+                :label-text="waitingLabel(exec)"
               ></progress-bar>
               <progress-bar
                 v-else-if="exec.job && exec.job.averageDuration"
@@ -967,6 +974,11 @@ export default defineComponent({
     },
     executionStateCss(status: string) {
       return this.executionState(status).toUpperCase();
+    },
+    waitingLabel(exec: any): string {
+      return exec && exec.suspendType === "operator-pause"
+        ? "Paused by operator"
+        : "Waiting for confirmation";
     },
     reportStateCss(rpt: any) {
       return this.executionStateCss(this.reportState(rpt));

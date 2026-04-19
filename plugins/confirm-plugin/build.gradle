@@ -19,7 +19,7 @@
  * plugin. Ships with Rundeck OSS core. See docs/specs/confirm-workflow-step.md.
  */
 
-ext.pluginClassNames = 'org.rundeck.plugin.confirm.ConfirmWorkflowStep'
+ext.pluginClassNames = 'org.rundeck.plugin.confirm.ConfirmWorkflowStep,org.rundeck.plugin.confirm.ConfirmUIPlugin'
 ext.pluginName = 'Confirm'
 ext.pluginDescription = 'Pause workflow for human confirmation (approve/deny)'
 apply plugin: "java"

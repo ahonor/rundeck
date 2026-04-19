@@ -291,6 +291,11 @@ class ExecutionService implements ApplicationContextAware, StepExecutor, NodeSte
             if(e.customStatusString){
                 data.customStatus=e.customStatusString
             }
+            // Wave 6 cycle/workflow-suspend-resume: expose suspend type so
+            // activity list can distinguish operator-pause from confirmation.
+            if(e.suspendType){
+                data.suspendType=e.suspendType
+            }
                 if(e.retryExecution){
                     data.retryExecution=[
                             id:e.retryExecution.id,
@@ -3175,13 +3180,27 @@ class ExecutionService implements ApplicationContextAware, StepExecutor, NodeSte
         List<com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest> suspendRequests = result.getSuspendRequests()
         com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest primary = suspendRequests.isEmpty() ? null : suspendRequests.get(0)
         long timeoutMs = primary != null ? primary.getTimeoutMs() : 0L
-        // Derive the suspended step index from the result set. The engine
-        // adds every observed step result (success, failure, and suspended)
-        // to the result set in order; the final entry is the suspending step.
-        int suspendedStepIndex = result.getResultSet() != null ? result.getResultSet().size() - 1 : 0
-        if (suspendedStepIndex < 0) {
-            suspendedStepIndex = 0
+        // Build completed step results from the result set. The engine's
+        // rule-based processor does NOT guarantee result ordering — the
+        // suspended step may appear before completed steps. Collect all
+        // non-suspended entries and count them to derive the suspended
+        // step's 0-based index in the workflow command list (== the
+        // number of completed steps before it).
+        def resultSet = result.getResultSet()
+        def completedStepResults = []
+        if (resultSet != null) {
+            int completedIdx = 0
+            for (stepResult in resultSet) {
+                if (!stepResult.isSuspended()) {
+                    completedStepResults << new com.dtolabs.rundeck.core.execution.workflow.suspend.ExecutionCheckpoint.CompletedStepResult(
+                        completedIdx, stepResult.isSuccess(), [:])
+                    completedIdx++
+                }
+            }
         }
+        // The suspended step index is the count of completed steps
+        // (i.e., it's the next step after all completed ones).
+        int suspendedStepIndex = completedStepResults.size()
 
         def checkpoint = new com.dtolabs.rundeck.core.execution.workflow.suspend.ExecutionCheckpoint(
                 com.dtolabs.rundeck.core.execution.workflow.suspend.ExecutionCheckpoint.CURRENT_VERSION,
@@ -3189,7 +3208,7 @@ class ExecutionService implements ApplicationContextAware, StepExecutor, NodeSte
                 primary,
                 null,   // context data: Wave 4 populates
                 null,   // checkpointable components: Wave 4 populates
-                null    // completed step results: Wave 4 populates
+                completedStepResults
         )
 
         def objectMapper = new com.fasterxml.jackson.databind.ObjectMapper()
@@ -3217,7 +3236,7 @@ class ExecutionService implements ApplicationContextAware, StepExecutor, NodeSte
             e.checkpointData = checkpointJson
             e.suspendMetadata = metadataJson
             e.save(flush: true)
-            log.info("Execution ${execId} suspended at step ${suspendedStepIndex + 1} (timeout at ${timeoutAt ?: 'never'})")
+            log.info("Execution ${execId} suspended at step ${suspendedStepIndex + 1} (timeout at ${timeoutAt ?: 'never'}, completedSteps=${completedStepResults.size()})")
         }
 
         // Fire notification event AFTER the DB transaction commits (spec §4

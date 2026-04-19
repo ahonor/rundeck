@@ -46,6 +46,7 @@ import com.dtolabs.rundeck.core.execution.workflow.steps.StepExecutor;
 import com.dtolabs.rundeck.core.execution.workflow.steps.node.NodeStepException;
 import com.dtolabs.rundeck.core.execution.workflow.steps.node.NodeStepResult;
 import com.dtolabs.rundeck.core.execution.workflow.steps.node.NodeStepResultImpl;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -81,6 +82,13 @@ public class NodeFirstWorkflowExecutor extends BaseWorkflowExecutor {
         boolean workflowsuccess = true;
         String statusString=null;
         ControlBehavior controlBehavior = null;
+        // Wave 6 cycle/workflow-suspend-resume: when a dispatched workflow
+        // section suspends, collect the SuspendRequests so the outer
+        // BaseWorkflowExecutionResult can be built with suspended=true. Without
+        // this, the node-first strategy swallows the suspension and the
+        // execution is reported as failed.
+        final List<SuspendRequest> suspendRequests = new ArrayList<>();
+        boolean workflowSuspended = false;
 
         final WFSharedContext wfCurrentContext = WFSharedContext.withBase(executionContext.getSharedDataContext());
         try {
@@ -121,7 +129,8 @@ public class NodeFirstWorkflowExecutor extends BaseWorkflowExecutor {
                             failures,
                             stepFailures,
                             flowsection,
-                            wfCurrentContext
+                            wfCurrentContext,
+                            suspendRequests
                     );
                     sectionSuccess = workflowStatusDataResult;
                     sectionData = workflowStatusDataResult;
@@ -150,6 +159,14 @@ public class NodeFirstWorkflowExecutor extends BaseWorkflowExecutor {
                     sectionSuccess = workflowExecutionResult;
                     sectionData = workflowExecutionResult;
 
+                    // Wave 6: propagate suspension from the non-dispatch section's
+                    // inner result (e.g. a confirm step in a mixed workflow).
+                    if (workflowExecutionResult.isSuspended()) {
+                        workflowSuspended = true;
+                        if (workflowExecutionResult.getSuspendRequests() != null) {
+                            suspendRequests.addAll(workflowExecutionResult.getSuspendRequests());
+                        }
+                    }
                 }
                 //combine output results for the section
                 wfCurrentContext.merge(sectionData.getSharedContext());
@@ -165,6 +182,12 @@ public class NodeFirstWorkflowExecutor extends BaseWorkflowExecutor {
                 }
                 if(sectionSuccess.getStatusString() !=null) {
                     statusString = sectionSuccess.getStatusString();
+                }
+                if (!suspendRequests.isEmpty()) {
+                    workflowSuspended = true;
+                }
+                if (workflowSuspended) {
+                    break;
                 }
                 if (!workflowsuccess && !item.getWorkflow().isKeepgoing() || controlBehavior == ControlBehavior.Halt) {
                     break;
@@ -200,6 +223,23 @@ public class NodeFirstWorkflowExecutor extends BaseWorkflowExecutor {
         }
         final Exception fexception = exception;
 
+        // Wave 6 cycle/workflow-suspend-resume: when any section suspended,
+        // return a suspended BaseWorkflowExecutionResult carrying the collected
+        // SuspendRequests. Without this, the node-first strategy swallows the
+        // suspension and the execution is reported as failed.
+        if (workflowSuspended || !suspendRequests.isEmpty()) {
+            return new BaseWorkflowExecutionResult(
+                    results,
+                    failures,
+                    stepFailures,
+                    fexception,
+                    wfresult,
+                    wfCurrentContext,
+                    true,
+                    suspendRequests
+            );
+        }
+
         return new BaseWorkflowExecutionResult(
                 results,
                 failures,
@@ -222,7 +262,8 @@ public class NodeFirstWorkflowExecutor extends BaseWorkflowExecutor {
             Map<String, Collection<StepExecutionResult>> failures,
             final Map<Integer, StepExecutionResult> stepFailures,
             IWorkflow flowsection,
-            WFSharedContext sharedContext
+            WFSharedContext sharedContext,
+            List<SuspendRequest> suspendRequests
     )
             throws ExecutionServiceException, DispatcherException
     {
@@ -254,7 +295,8 @@ public class NodeFirstWorkflowExecutor extends BaseWorkflowExecutor {
                 failures,
                 stepFailures,
                 flowsection.getCommands().size(),
-                stepCount
+                stepCount,
+                suspendRequests
         );
         return workflowResult(dispatch.isSuccess(), null, ControlBehavior.Continue, resultData);
     }
@@ -268,7 +310,8 @@ public class NodeFirstWorkflowExecutor extends BaseWorkflowExecutor {
             final Map<String, Collection<StepExecutionResult>> failures,
             final Map<Integer, StepExecutionResult> stepFailures,
             int index,
-            int max
+            int max,
+            final List<SuspendRequest> suspendRequests
     )
     {
         WFSharedContext wfSharedContext = new WFSharedContext();
@@ -292,6 +335,13 @@ public class NodeFirstWorkflowExecutor extends BaseWorkflowExecutor {
 
             //This NodeStepResult is produced by the DispatchedWorkflow wrapper
             WorkflowExecutionResult result = DispatchedWorkflow.extractWorkflowResult(stepResult);
+
+            // Wave 6: collect suspend requests from the inner per-node workflow
+            // so the outer NodeFirstWorkflowExecutor can build a suspended
+            // BaseWorkflowExecutionResult.
+            if (result.isSuspended() && result.getSuspendRequests() != null) {
+                suspendRequests.addAll(result.getSuspendRequests());
+            }
 
             failures.computeIfAbsent(nodeName, k -> new ArrayList<>());
 

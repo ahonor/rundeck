@@ -910,6 +910,14 @@ function NodeFlowViewModel(workflow, outputUrl, nodeStateUpdateUrl, multiworkflo
     self.partial=ko.observable();
     self.executionState=ko.observable();
     self.executionStatusString=ko.observable();
+    // Wave 6 cycle/workflow-suspend-resume: operator-pause state fed by
+    // ajaxExecState on every poll. Drives the Pause/Resume button's
+    // visibility and state next to Kill — see execution/show.gsp.
+    self.pauseRequested=ko.observable(false);
+    self.suspendType=ko.observable(null);
+    self.callerCanPause=ko.observable(false);
+    self.pauseActionPending=ko.observable(false);
+    self.topLevelStepCount=ko.observable(0);
     self.retryExecutionId=ko.observable();
     self.retryExecutionState=ko.observable();
     self.retryExecutionUrl=ko.observable();
@@ -1032,6 +1040,112 @@ function NodeFlowViewModel(workflow, outputUrl, nodeStateUpdateUrl, multiworkflo
         }
         return data && data.cancelled && data.status === 'db-error';
     });
+
+    // ----- Wave 6 cycle/workflow-suspend-resume: operator pause/resume -----
+    //
+    // Pause is a runtime operational control (like Kill), not a step
+    // primitive. It shares the Kill button row and plumbs through the same
+    // follow-poll data flow: ajaxExecState -> KO observables -> data-bind in
+    // execution/show.gsp. See docs/specs/operator-pause-resume.md §6.
+    //
+    // A single modal button renders in the execution action row. Its mode
+    // (pause | pending | resume) flips based on the execution's state on
+    // every poll tick:
+    //   pause   — running, multi-step, not on last step, caller has ACL
+    //   pending — pauseRequested flag set but engine hasn't parked yet
+    //   resume  — execution is waiting with suspendType='operator-pause'
+    //
+    // pauseControlMode is the single source of truth; label, css, icon,
+    // title, and click action all derive from it.
+    self.pauseControlMode = ko.pureComputed(function () {
+        if (!self.callerCanPause()) return 'hidden';
+        var state = self.executionState();
+        if (state === 'RUNNING') {
+            if (self.pauseRequested()) return 'pending';
+            if (self.topLevelStepCount() > 1) return 'pause';
+            return 'hidden';
+        }
+        if (state === 'WAITING' && self.suspendType() === 'operator-pause') {
+            return 'resume';
+        }
+        return 'hidden';
+    });
+    self.pauseControlVisible = ko.pureComputed(function () {
+        return self.pauseControlMode() !== 'hidden';
+    });
+    self.pauseControlLabel = ko.pureComputed(function () {
+        switch (self.pauseControlMode()) {
+            case 'pause':   return 'Pause ';
+            case 'pending': return 'Pause requested\u2026 ';
+            case 'resume':  return 'Resume ';
+            default:        return '';
+        }
+    });
+    self.pauseControlCss = ko.pureComputed(function () {
+        var mode = self.pauseControlMode();
+        return {
+            'btn-warning': mode === 'pause' || mode === 'pending',
+            'btn-success': mode === 'resume',
+            'disabled':    mode === 'pending'
+        };
+    });
+    self.pauseControlIcon = ko.pureComputed(function () {
+        var mode = self.pauseControlMode();
+        return {
+            'fas': true,
+            'fa-pause': mode === 'pause' || mode === 'pending',
+            'fa-play':  mode === 'resume'
+        };
+    });
+    self.pauseControlTitle = ko.pureComputed(function () {
+        switch (self.pauseControlMode()) {
+            case 'pause':   return 'Pause at next step boundary';
+            case 'pending': return 'Waiting for current step to finish';
+            case 'resume':  return 'Resume paused execution';
+            default:        return '';
+        }
+    });
+    // Preserve margin via the style attr binding so disabled mode also
+    // gets the not-allowed cursor without duplicating markup.
+    self.pauseControlStyle = ko.pureComputed(function () {
+        return self.pauseControlMode() === 'pending'
+            ? 'margin-right:6px; cursor:not-allowed;'
+            : 'margin-right:6px;';
+    });
+    self.pauseControlAction = function () {
+        var mode = self.pauseControlMode();
+        if (mode === 'pause') return self._postPauseControl('pauseExecution', { pauseRequestedOptimistic: true });
+        if (mode === 'resume') return self._postPauseControl('resumeExecution', {});
+        // 'pending' and 'hidden' are no-ops
+    };
+    // Browser UI posts to /execution/<action> (not /api/) so the session
+    // token flow works like the Kill button — see UrlMappings for details.
+    self._postPauseControl = function (action, opts) {
+        if (self.pauseActionPending()) return;
+        self.pauseActionPending(true);
+        if (opts.pauseRequestedOptimistic) self.pauseRequested(true);
+        var execId = self.executionId();
+        var rdBase = (window._rundeck && window._rundeck.rdBase) || '';
+        rdBase = String(rdBase).replace(/\/$/, '');
+        jQuery.ajax({
+            url: rdBase + '/execution/' + action,
+            type: 'POST',
+            dataType: 'json',
+            data: { id: execId },
+            beforeSend: _createAjaxSendTokensHandler('exec_cancel_token'),
+            complete: function () { self.pauseActionPending(false); },
+            error: function (xhr) {
+                if (opts.pauseRequestedOptimistic) self.pauseRequested(false);
+                var msg = 'HTTP ' + xhr.status;
+                try {
+                    var body = JSON.parse(xhr.responseText);
+                    if (body.message) msg = body.message;
+                    else if (typeof body.error === 'string') msg = body.error;
+                } catch (e) {}
+                window.alert('Action failed: ' + msg);
+            }
+        }).done(_createAjaxReceiveTokensHandler('exec_cancel_token'));
+    };
     self.totalNodeCount=ko.observable(0);
     self.nodeIndex={};
     self.totalNodes=ko.pureComputed(function(){
@@ -1443,7 +1557,12 @@ function NodeFlowViewModel(workflow, outputUrl, nodeStateUpdateUrl, multiworkflo
                     execDuration: data.execDuration,
                     jobAverageDuration: data.jobAverageDuration,
                     startTime: data.startTime ? data.startTime : data.state ? data.state.startTime : null,
-                    endTime: data.endTime ? data.endTime : data.state ? data.state.endTime : null
+                    endTime: data.endTime ? data.endTime : data.state ? data.state.endTime : null,
+                    // Wave 6 cycle/workflow-suspend-resume
+                    pauseRequested: !!data.pauseRequested,
+                    suspendType: data.suspendType || null,
+                    callerCanPause: !!data.callerCanPause,
+                    topLevelStepCount: (typeof data.totalSteps === 'number') ? data.totalSteps : 0
                 }, {}, self);
             },
             updateState: function (data) {
@@ -1460,7 +1579,12 @@ function NodeFlowViewModel(workflow, outputUrl, nodeStateUpdateUrl, multiworkflo
                     execDuration: data.execDuration,
                     jobAverageDuration: data.jobAverageDuration,
                     startTime: data.startTime ? data.startTime : data.state ? data.state.startTime : null,
-                    endTime: data.endTime ? data.endTime : data.state ? data.state.endTime : null
+                    endTime: data.endTime ? data.endTime : data.state ? data.state.endTime : null,
+                    // Wave 6 cycle/workflow-suspend-resume
+                    pauseRequested: !!data.pauseRequested,
+                    suspendType: data.suspendType || null,
+                    callerCanPause: !!data.callerCanPause,
+                    topLevelStepCount: (typeof data.totalSteps === 'number') ? data.totalSteps : 0
                 }, {}, self);
                 if(followNodes) {
                     self.updateNodes(data.state);

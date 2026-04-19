@@ -370,6 +370,17 @@ class ExecutionController extends ControllerBase{
         }
         def isClusterExec = frameworkService.isClusterModeEnabled() && e.serverNodeUUID !=
                 frameworkService.getServerUUID()
+        // Wave 6 cycle/workflow-suspend-resume: surface operator-pause state so
+        // the execution/show Knockout view model can render the Pause/Resume
+        // button alongside Kill. The front-end polls this endpoint every
+        // 1500ms via FlowState; updates flow straight into the KO model.
+        boolean callerCanPause = false
+        try {
+            AuthContext pauseAuthCtx = rundeckAuthContextProcessor.getAuthContextForSubjectAndProject(
+                    session.subject, e.project)
+            callerCanPause = rundeckAuthContextProcessor.authorizeProjectExecutionAll(
+                    pauseAuthCtx, e, [AuthConstants.ACTION_PAUSE])
+        } catch (Exception ignored) {}
         def data=[
                 completed            : jobcomplete,
                 execDuration         : execDuration,
@@ -381,7 +392,14 @@ class ExecutionController extends ControllerBase{
                 retryAttempt         : e.retryAttempt,
                 retry                : e.retry,
                 serverNodeUUID       : e.serverNodeUUID,
-                clusterExec          : isClusterExec
+                clusterExec          : isClusterExec,
+                pauseRequested       : (e.pauseRequested ?: false),
+                suspendType          : e.suspendType,
+                callerCanPause       : callerCanPause,
+                // Top-level step count (0 until the state summary is
+                // available). Used by the KO model to only show the Pause
+                // button on multi-step jobs.
+                totalSteps           : 0
         ]
         if(e.retryExecution){
             data['retryExecutionId']=e.retryExecution.id
@@ -405,6 +423,17 @@ class ExecutionController extends ControllerBase{
         )
         if (loader.state.isAvailableOrPartial()) {
             data.state = loader.workflowState
+            // Wave 6: the workflow state summary always carries a top-level
+            // stepCount; steps[] detail is populated only when the caller
+            // asks for stepStates=true. Use stepCount for the Pause button's
+            // "multi-step job" check and skip the "last step" refinement —
+            // spec §8 already states that a pause API call on the last step
+            // is accepted but is a no-op, so the UX cost of showing the
+            // button during the last step is minimal.
+            try {
+                def sc = loader.workflowState?.stepCount
+                if (sc != null) data.totalSteps = (sc as int)
+            } catch (Exception ignored) {}
         }else if(loader.state in [ExecutionFileState.NOT_FOUND]) {
             data.state = [error: 'not found',
                     errorMessage: g.message(code: 'execution.state.storage.state.' + loader.state,

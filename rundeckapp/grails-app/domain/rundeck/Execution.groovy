@@ -89,7 +89,7 @@ class Execution extends ExecutionContext implements EmbeddedJsonData, ExecutionD
     boolean serverNodeUUIDChanged = false
 
     static hasOne = [logFileStorageRequest: LogFileStorageRequest]
-    static transients = ['executionState', 'customStatusString', 'userRoles', 'extraMetadataMap', 'serverNodeUUIDChanged', 'execIdForLogStore', 'workflowJsonMap', 'workflowData']
+    static transients = ['executionState', 'customStatusString', 'userRoles', 'extraMetadataMap', 'serverNodeUUIDChanged', 'execIdForLogStore', 'workflowJsonMap', 'workflowData', 'suspendType']
     static constraints = {
         importFrom SharedExecutionConstraints
         importFrom SharedNodeConfigConstraints
@@ -344,6 +344,21 @@ class Execution extends ExecutionContext implements EmbeddedJsonData, ExecutionD
 
     public String getCustomStatusString(){
         executionState==ExecutionService.EXECUTION_STATE_OTHER?status:null
+    }
+
+    /**
+     * Parse the suspendMetadata JSON and return the 'type' discriminator
+     * (e.g. 'operator-pause' or 'confirmation'). Null when the execution
+     * is not waiting or the metadata is missing/invalid.
+     */
+    public String getSuspendType(){
+        if(!suspendMetadata) return null
+        try {
+            def parsed = new com.fasterxml.jackson.databind.ObjectMapper().readValue(suspendMetadata, Map)
+            return parsed?.get('type')
+        } catch (Exception ignored) {
+            return null
+        }
     }
 
     public static boolean isCustomStatusString(String value){

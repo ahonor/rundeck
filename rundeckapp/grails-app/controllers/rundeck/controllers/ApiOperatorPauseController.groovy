@@ -64,10 +64,13 @@ class ApiOperatorPauseController {
             return
         }
 
-        // Must be running
-        if (execution.status != ExecutionService.EXECUTION_RUNNING && execution.status != 'running') {
+        // Must be running. The DB 'status' column is null for in-flight
+        // executions; use getExecutionState() which derives the logical
+        // state from status + dateCompleted + other flags.
+        String state = execution.executionState
+        if (state != ExecutionService.EXECUTION_RUNNING) {
             response.status = 409
-            render([error: "execution is not running (status: ${execution.status})"] as grails.converters.JSON)
+            render([error: "execution is not running (status: ${state})"] as grails.converters.JSON)
             return
         }
 
@@ -87,12 +90,15 @@ class ApiOperatorPauseController {
         // Set pause_requested flag in the DB. The engine's StepCallable
         // reads this flag (via the pauseCheckSupplier on the context) before
         // each step invocation and synthesizes a suspension if true.
+        //
+        // Use HQL executeUpdate to avoid Hibernate optimistic-lock version
+        // conflicts with the execution worker thread, which concurrently
+        // writes to the same row (e.g. when persisting step state).
         Execution.withNewTransaction {
-            Execution e = Execution.get(execId)
-            if (e) {
-                e.pauseRequested = true
-                e.save(flush: true)
-            }
+            Execution.executeUpdate(
+                    "update Execution e set e.pauseRequested = true where e.id = :id",
+                    [id: execId]
+            )
         }
         log.info("Pause requested for execution ${execId} by ${request.remoteUser}: ${reason}")
 
@@ -162,13 +168,13 @@ class ApiOperatorPauseController {
                 comment
         )
 
-        // Clear the pause_requested flag + mark resume ready
+        // Clear the pause_requested flag via HQL executeUpdate to avoid
+        // optimistic-lock conflicts with the resume worker.
         Execution.withNewTransaction {
-            Execution e = Execution.get(execId)
-            if (e) {
-                e.pauseRequested = false
-                e.save(flush: true)
-            }
+            Execution.executeUpdate(
+                    "update Execution e set e.pauseRequested = false where e.id = :id",
+                    [id: execId]
+            )
         }
 
         boolean marked = executionResumeService.markResumeReady(execution.id, payload)
@@ -214,7 +220,8 @@ class ApiOperatorPauseController {
             } catch (Exception ignored) {}
         }
 
-        boolean isOperatorPause = execution.status == ExecutionService.EXECUTION_WAITING &&
+        String state = execution.executionState
+        boolean isOperatorPause = state == ExecutionService.EXECUTION_WAITING &&
                 metadata.get('type') == 'operator-pause'
 
         // Check ACL
@@ -228,7 +235,7 @@ class ApiOperatorPauseController {
 
         render([
                 pauseRequested: execution.pauseRequested,
-                currentStatus: execution.status,
+                currentStatus: state,
                 suspendType: isOperatorPause ? 'operator-pause' : metadata.get('type'),
                 requestedBy: metadata.get('requestedBy'),
                 requestedAt: metadata.get('requestedAt'),

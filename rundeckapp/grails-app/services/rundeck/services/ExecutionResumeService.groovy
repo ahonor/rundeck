@@ -22,6 +22,7 @@ import com.dtolabs.rundeck.core.execution.WorkflowExecutionServiceThread
 import com.dtolabs.rundeck.core.execution.workflow.EngineWorkflowExecutor
 import com.dtolabs.rundeck.core.execution.workflow.WorkflowExecutionListenerImpl
 import com.dtolabs.rundeck.core.execution.workflow.NoopWorkflowExecutionListener
+import com.dtolabs.rundeck.app.internal.workflow.MultiWorkflowExecutionListener
 import com.dtolabs.rundeck.core.logging.LogUtil
 import com.dtolabs.rundeck.core.execution.workflow.StepExecutionContext
 import com.dtolabs.rundeck.core.execution.workflow.WFSharedContext
@@ -74,6 +75,7 @@ class ExecutionResumeService {
     AppAuthContextProcessor rundeckAuthContextProcessor
     def storageService
     def rundeckNodeService
+    WorkflowService workflowService
 
     private final ObjectMapper objectMapper = new ObjectMapper()
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
@@ -262,16 +264,51 @@ class ExecutionResumeService {
 
         // 7. Build execution context
         def project = execution.project
-        // Use the real WorkflowExecutionListenerImpl with a proper logger.
-        // This is the same class used by executeAsyncBegin. It properly
-        // implements createOverride(), setFailedNodesListener(), and all
-        // the listener contracts that downstream node dispatch requires.
-        def resumeLogger = new com.dtolabs.rundeck.core.execution.ExecutionLogger() {
-            void log(int level, String message) { log.info("[resume-exec] $message") }
-            void log(int level, String message, Map meta) { log.info("[resume-exec] $message") }
-            void event(String eventType, String message, Map meta) {}
-        }
-        def executionListener = new WorkflowExecutionListenerImpl(null, resumeLogger)
+        // Build the listener chain the same way executeAsyncBegin does:
+        // 1. ContextManager tracks current step/node for log event metadata
+        // 2. ContextLogWriter stamps log events with step context
+        // 3. LoggerWithContext combines them into an ExecutionLogger
+        // 4. WorkflowExecutionListenerImpl uses the logger for step lifecycle
+        // 5. WorkflowExecutionStateListenerAdapter for persisted step state
+        // 6. MultiWorkflowExecutionListener to combine them
+        def contextmanager = new com.dtolabs.rundeck.core.execution.workflow.ContextManager()
+        // Filter debug/verbose log messages from the execution log, matching
+        // the normal execution path's LoglevelThresholdLogWriter behavior.
+        def logLevel = com.dtolabs.rundeck.core.logging.LogLevel.looseValueOf(
+                execution.loglevel ?: 'INFO', com.dtolabs.rundeck.core.logging.LogLevel.NORMAL)
+        def filteredWriter = new rundeck.services.logging.LoglevelThresholdLogWriter(loghandler, logLevel)
+        def contextLogWriter = new com.dtolabs.rundeck.core.logging.ContextLogWriter(filteredWriter)
+        def resumeLogger = new com.dtolabs.rundeck.core.execution.workflow.LoggerWithContext(
+                contextLogWriter, contextmanager)
+        def baseListener = new WorkflowExecutionListenerImpl(null, resumeLogger)
+
+        // Create the workflow state listener that persists per-step state
+        // to the state file. This is what the UI's execution detail page
+        // reads to show step-by-step progress.
+        def jobcontext = executionService.exportContextForExecution(
+                execution, executionService.grailsLinkGenerator)
+        WorkflowExecutionItem item = executionUtilService.createExecutionItemForWorkflow(
+                execution.workflowData)
+        def execStateListener = workflowService.createWorkflowStateListenerForExecution(
+                execution,
+                item.workflow,
+                framework,
+                authContext,
+                jobcontext,
+                null  // secureOpts not needed for state tracking
+        )
+
+        // Combine into a multi-listener. The contextmanager must be in
+        // the list so it tracks step begin/end for log context stamping.
+        // WorkflowEventLoggerListener is intentionally excluded — its
+        // verbose "[workflow] Begin step" messages belong in the output
+        // view but not the nodes view.
+        def logOutFlusher = new com.dtolabs.rundeck.core.logging.internal.LogFlusher()
+        def logErrFlusher = new com.dtolabs.rundeck.core.logging.internal.LogFlusher()
+        def executionListener = MultiWorkflowExecutionListener.create(
+                baseListener,
+                [contextmanager, baseListener, execStateListener, logOutFlusher, logErrFlusher]
+        )
 
         def localNodeName = framework.frameworkNodeName
         def localNode = new com.dtolabs.rundeck.core.common.NodeEntryImpl(localNodeName)
@@ -303,22 +340,64 @@ class ExecutionResumeService {
                 .stepNumber(1)
                 .build()
 
-        // 8. Build workflow item
-        WorkflowExecutionItem item = executionUtilService.createExecutionItemForWorkflow(
-                execution.workflowData)
+        // Install thread-bound stdout/stderr streams so command output
+        // (e.g., echo "Step 3 done") is captured in the execution log
+        // with proper step context, just like the normal execution path.
+        executionUtilService.sysThreadBoundOut.installThreadStream(
+                loggingService.createLogOutputStream(
+                        filteredWriter,
+                        com.dtolabs.rundeck.core.logging.LogLevel.NORMAL,
+                        contextmanager,
+                        logOutFlusher,
+                        null
+                )
+        )
+        executionUtilService.sysThreadBoundErr.installThreadStream(
+                loggingService.createLogOutputStream(
+                        filteredWriter,
+                        com.dtolabs.rundeck.core.logging.LogLevel.ERROR,
+                        contextmanager,
+                        logErrFlusher,
+                        null
+                )
+        )
+
+        // 8. Workflow item already built above for the state listener
 
         // 9. Execute resume
-        def engineExecutor = (EngineWorkflowExecutor) framework
+        // Wave 6 cycle/workflow-suspend-resume: when the job uses the
+        // node-first strategy, getExecutorForItem returns a
+        // NodeFirstWorkflowExecutor wrapping an EngineWorkflowExecutor. The
+        // resume path needs the inner EngineWorkflowExecutor directly because
+        // executeWorkflowResume is defined there and operates on the raw
+        // commands list. Wrap the workflow in an inner-loop item so the
+        // lookup returns the engine executor.
+        def resumeItem = com.dtolabs.rundeck.core.execution.workflow
+                .NodeFirstWorkflowExecutor.createInnerLoopItem(item.workflow)
+        def lookedUp = framework
                 .getWorkflowExecutionService()
-                .getExecutorForItem(item)
+                .getExecutorForItem(resumeItem)
+        if (!(lookedUp instanceof EngineWorkflowExecutor)) {
+            throw new IllegalStateException(
+                    "Expected EngineWorkflowExecutor for inner-loop resume, got " +
+                            lookedUp?.class?.name)
+        }
+        def engineExecutor = (EngineWorkflowExecutor) lookedUp
+        // executeWorkflowResume uses item.getWorkflow().getCommands() which
+        // must still point at the real workflow commands. The inner-loop
+        // wrapper preserves that.
+        item = resumeItem
 
         log.info("Entering executeWorkflowResume for execution ${execId} " +
-                 "at suspended step index ${checkpoint.suspendedStepIndex}")
+                 "at suspended step index ${checkpoint.suspendedStepIndex}, " +
+                 "completedStepResults=${checkpoint.completedStepResults?.size() ?: 0}, " +
+                 "stateAdapter=${execStateListener?.class?.simpleName}, localNode=${localNodeName}")
 
         WorkflowExecutionResult result
         try {
             result = engineExecutor.executeWorkflowResume(
-                    executionContext, item, checkpoint, payload, metadata)
+                    executionContext, item, checkpoint, payload, metadata,
+                    execStateListener, localNodeName)
         } catch (Throwable t) {
             log.error("executeWorkflowResume failed for execution ${execId}: ${t.message}", t)
             loghandler.logError("Resume failed: ${t.message}")
@@ -326,6 +405,17 @@ class ExecutionResumeService {
             releaseClaim(execId)
             return
         } finally {
+            // Tear down thread-bound stdout/stderr streams
+            try {
+                executionUtilService.sysThreadBoundOut.removeThreadStream()?.close()
+            } catch (Throwable t) {
+                log.warn("Could not remove thread-bound stdout on resume: ${t.message}")
+            }
+            try {
+                executionUtilService.sysThreadBoundErr.removeThreadStream()?.close()
+            } catch (Throwable t) {
+                log.warn("Could not remove thread-bound stderr on resume: ${t.message}")
+            }
             // Close the log writer (writes ^END^ footer on normal path)
             if (result != null && !result.isSuspended()) {
                 try {
@@ -360,7 +450,7 @@ class ExecutionResumeService {
             // (not via saveExecutionState which opens a nested transaction
             // and causes version conflicts with our outer session).
             execution.refresh() // sync version after engine ran
-            execution.status = result.isSuccess() ? 'true' : 'false'
+            execution.status = result.isSuccess() ? ExecutionService.EXECUTION_SUCCEEDED : ExecutionService.EXECUTION_FAILED
             execution.dateCompleted = new Date()
             // Clear suspend-related columns per I11
             execution.checkpointData = null
@@ -374,6 +464,34 @@ class ExecutionResumeService {
             execution.pauseRequested = false
             execution.save(flush: true)
             log.info("Execution ${execId} resumed and completed with success=${result.isSuccess()}")
+
+            // Write execution report so the activity/history page shows
+            // this execution. The normal path does this via
+            // saveExecutionState → logExecution; we call it directly.
+            executionService.logExecution(
+                    null,
+                    execution.project,
+                    execution.user,
+                    result.isSuccess(),
+                    execution.status,
+                    execId,
+                    execution.dateStarted,
+                    execution.scheduledExecution?.extid,
+                    execution.scheduledExecution?.jobName ?: 'adhoc',
+                    execution.scheduledExecution ?
+                            (execution.scheduledExecution.groupPath ? execution.scheduledExecution.groupPath + '/' : '') +
+                            execution.scheduledExecution.jobName : 'adhoc',
+                    false,  // cancelled
+                    false,  // timedOut
+                    false,  // willRetry
+                    null,   // node summary
+                    null,   // abortedby
+                    execution.succeededNodeList,
+                    execution.failedNodeList,
+                    execution.filter,
+                    execution.uuid,
+                    execution.scheduledExecution?.uuid
+            )
         }
 
         } // end withNewSession
