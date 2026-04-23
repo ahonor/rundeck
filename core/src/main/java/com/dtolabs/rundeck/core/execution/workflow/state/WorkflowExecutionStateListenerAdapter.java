@@ -235,4 +235,45 @@ public class WorkflowExecutionStateListenerAdapter implements WorkflowExecutionL
         stepContext.finishNodeContext();
     }
 
+    /**
+     * Replay a completed step's state transitions for resume scenarios.
+     * Unlike the normal listener path, this fires state transitions directly
+     * regardless of whether the step is a node-dispatch step or not.
+     * Used by {@code EngineWorkflowExecutor.executeWorkflowResume} to
+     * pre-populate the state model with steps that completed before suspend.
+     *
+     * @param step    1-based step number
+     * @param success whether the step succeeded
+     * @param node    the node name the step ran on (null for non-node steps)
+     */
+    public void replayCompletedStep(int step, boolean success, String node) {
+        Date now = new Date();
+        ExecutionState finalState = success ? ExecutionState.SUCCEEDED : ExecutionState.FAILED;
+
+        // Begin step context
+        stepContext.beginStepContext(StateUtils.stepContextId(step, false));
+        StepIdentifier id = createIdentifier();
+
+        // Step-level: RUNNING
+        notifyAllStepState(id, createStepStateChange(ExecutionState.RUNNING), now);
+
+        if (node != null) {
+            // Node-level: RUNNING then SUCCEEDED/FAILED
+            INodeEntry nodeEntry = new com.dtolabs.rundeck.core.common.NodeEntryImpl(node);
+            stepContext.beginNodeContext(nodeEntry);
+            StepIdentifier nodeId = createIdentifier();
+            notifyAllStepState(nodeId, createStepStateChange(ExecutionState.RUNNING), now);
+            notifyAllStepState(nodeId,
+                    StateUtils.stepStateChange(StateUtils.stepState(finalState), node), now);
+            stepContext.finishNodeContext();
+        } else {
+            // Non-node step: direct SUCCEEDED/FAILED
+            notifyAllStepState(id,
+                    StateUtils.stepStateChange(StateUtils.stepState(finalState), null), now);
+        }
+
+        // Finish step context
+        stepContext.finishStepContext();
+    }
+
 }

@@ -23,6 +23,8 @@ import com.dtolabs.rundeck.core.execution.workflow.suspend.ConfirmationPayload;
 import com.dtolabs.rundeck.core.execution.workflow.suspend.ResumePayload;
 import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest;
 import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspensionNotAllowedException;
+import com.dtolabs.rundeck.core.data.BaseDataContext;
+import com.dtolabs.rundeck.core.dispatcher.ContextView;
 import com.dtolabs.rundeck.core.plugins.Plugin;
 import com.dtolabs.rundeck.plugins.ExecutionEnvironmentConstants;
 import com.dtolabs.rundeck.plugins.ServiceNameConstants;
@@ -186,27 +188,43 @@ public class ConfirmWorkflowStep implements StepPlugin {
             }
 
             String decision = payload.getDecision();
+            String comment = payload.getComment() != null ? payload.getComment() : "";
+            String confirmedBy = payload.getConfirmedBy() != null ? payload.getConfirmedBy() : "";
+
+            // Export confirmation data as output variables for subsequent steps.
+            // Available as ${data.confirm.*} in downstream steps.
+            // Write to both the output context (normal engine merge path)
+            // and directly to the shared data context (resume path where
+            // the normal merge may not fire).
+            pluginContext.getOutputContext().addOutput(ContextView.global(), "confirm", "decision", decision);
+            pluginContext.getOutputContext().addOutput(ContextView.global(), "confirm", "comment", comment);
+            pluginContext.getOutputContext().addOutput(ContextView.global(), "confirm", "confirmedBy", confirmedBy);
+            if (payload.getConfirmedAt() != null) {
+                pluginContext.getOutputContext().addOutput(ContextView.global(), "confirm", "confirmedAt",
+                        payload.getConfirmedAt().toString());
+            }
+            // Also write directly to the shared data context for the resume path
+            Map<String, String> confirmData = new HashMap<>();
+            confirmData.put("decision", decision);
+            confirmData.put("comment", comment);
+            confirmData.put("confirmedBy", confirmedBy);
+            if (payload.getConfirmedAt() != null) {
+                confirmData.put("confirmedAt", payload.getConfirmedAt().toString());
+            }
+            context.getSharedDataContext().merge(
+                    ContextView.global(),
+                    new BaseDataContext("confirm", confirmData));
+
             if ("approve".equals(decision)) {
                 pluginContext.getLogger().log(
                         2,
-                        String.format("[confirm] Confirmed by %s (roles: %s): %s",
-                                payload.getConfirmedBy(),
-                                payload.getConfirmerRoles(),
-                                payload.getComment() != null ? payload.getComment() : "")
+                        String.format("[confirm] Confirmed by %s: %s", confirmedBy, comment)
                 );
-                // Success: return normally
                 return;
             } else {
-                // deny or any other non-success decision
-                pluginContext.getLogger().log(
-                        0,
-                        String.format("[confirm] Rejected by %s: %s (decision: %s)",
-                                payload.getConfirmedBy(),
-                                payload.getComment() != null ? payload.getComment() : "",
-                                decision)
-                );
                 throw new StepException(
-                        "Confirmation denied: " + decision,
+                        "[confirm] Denied by " + confirmedBy +
+                                (!comment.isEmpty() ? ": " + comment : ""),
                         ConfirmFailureReason.ConfirmDenied
                 );
             }

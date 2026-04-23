@@ -262,6 +262,15 @@ class ExecutionResumeService {
         }
         def loghandler = new ExecutionLogWriter(logWriter)
 
+        // Write an explicit [resume] marker to the execution log so operators
+        // have a direct trigger signal in the output view, paired with the
+        // [suspend] marker written at pause time.
+        try {
+            loghandler.log(buildResumeMarker(payload, metadata))
+        } catch (Throwable t) {
+            log.warn("Could not write resume marker to execution log for ${execId}: ${t.message}")
+        }
+
         // 7. Build execution context
         def project = execution.project
         // Build the listener chain the same way executeAsyncBegin does:
@@ -554,6 +563,38 @@ class ExecutionResumeService {
             log.info("Claimed execution ${execId} for resume on node ${serverUUID}")
         }
         return updated == 1
+    }
+
+    /**
+     * Build a human-readable [resume] marker line for the execution log.
+     * Varies by payload subtype so operators can see at a glance what
+     * triggered the resume.
+     */
+    private String buildResumeMarker(ResumePayload payload, Map<String, Object> metadata) {
+        if (payload == null) {
+            return "[resume] Execution resumed"
+        }
+        if (payload instanceof com.dtolabs.rundeck.core.execution.workflow.suspend.ConfirmationPayload) {
+            def cp = (com.dtolabs.rundeck.core.execution.workflow.suspend.ConfirmationPayload) payload
+            if (cp.isTimeout()) {
+                return "[resume] Execution resumed \u2014 confirmation timed out"
+            }
+            String who = cp.getConfirmedBy() ?: 'unknown'
+            String decision = cp.getDecision() ?: 'unknown'
+            String comment = cp.getComment() ?: ''
+            String verb = 'approve'.equals(decision) ? 'approved' :
+                          ('deny'.equals(decision) ? 'denied' : decision)
+            String suffix = comment.isEmpty() ? '' : (": " + comment)
+            return "[resume] Execution resumed \u2014 ${verb} by ${who}${suffix}"
+        }
+        if (payload instanceof com.dtolabs.rundeck.core.execution.workflow.suspend.OperatorResumePayload) {
+            def op = (com.dtolabs.rundeck.core.execution.workflow.suspend.OperatorResumePayload) payload
+            String who = op.getResumedBy() ?: 'unknown'
+            String comment = op.getComment() ?: ''
+            String suffix = comment.isEmpty() ? '' : (": " + comment)
+            return "[resume] Execution resumed \u2014 operator resume by ${who}${suffix}"
+        }
+        return "[resume] Execution resumed \u2014 payload: ${payload.getType()}"
     }
 
     /**

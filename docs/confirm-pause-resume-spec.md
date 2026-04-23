@@ -1,8 +1,8 @@
 # Confirm / Pause / Resume — As-Built Specification
 
-**Status:** Implemented and live-tested on branch `cycle/workflow-suspend-resume`.
-**Date:** 2026-04-18
-**Branch:** 15 commits ahead of main, ~70 files, ~9000+ lines.
+**Status:** Implemented and live-tested on branch `cycle/workflow-suspend-resume`. E2E verified via API.
+**Date:** 2026-04-18 (updated)
+**Branch:** ~70 files, ~9000+ lines.
 
 This document describes the suspend/resume feature as actually built and verified — not the theoretical design spec from the planning phase. The theoretical specs at `docs/specs/workflow-suspend-resume.md`, `docs/specs/confirm-workflow-step.md`, and `docs/specs/operator-pause.md` describe the intended design; this document describes what shipped and what didn't.
 
@@ -45,43 +45,64 @@ Any running multi-step execution can be paused at the next step boundary via `PO
 
 ---
 
-## 2. End-to-end flow (verified live)
+## 2. End-to-end flow (verified via automated API test)
 
 ```
-alice runs job: echo BUILD → confirm → echo DEPLOY
+alice runs job: echo "Step 1 done" → confirm → echo "Step 3 done"
   ↓
-Step 1 (BUILD) runs normally → "BUILD-OK"
+Step 1 runs normally on localhost → SUCCEEDED
   ↓
 Step 2 (confirm) calls context.suspend(request)
   → SuspendedStepResult stored in pendingSuspension field
   → StepPluginAdapter detects it, returns to engine
   → Engine rule STEP_SUSPENDED_END_WORKFLOW fires → loop exits
   → ExecutionJob detects thread.isSuspended()
-  → Log writer suspend-closed (no ^END^ footer)
-  → DB: status='waiting', serverNodeUUID=NULL, checkpoint saved
+  → Log writer suspend-closed (no ^END^ footer) via recursive MultiLogWriter traversal
+  → DB: status='waiting', serverNodeUUID=NULL, checkpoint saved with completedStepResults
   → Thread released
   ↓
-Execution visible in UI as "waiting" with orange pause icon
-Confirmation panel slides in on execution detail page
+API: GET /execution/{id} → status: "waiting"
+API: GET /execution/{id}/state →
+  Step 1: SUCCEEDED (localhost: SUCCEEDED)
+  Step 2: RUNNING (localhost: RUNNING)
+  Step 3: WAITING (localhost: WAITING)
+API: GET /execution/{id}/confirm/status → waiting: true, message: "...", callerCanConfirm: true
   ↓
-bob clicks Approve (or calls POST /api/{v}/execution/{id}/confirm)
+bob calls POST /execution/{id}/confirm with {"decision":"approve","comment":"LGTM"}
   → ExecutionConfirmation audit row written
   → resume_ready=true, resume_payload=ConfirmationPayload JSON
+  → Response: {"resumeReady":true,"confirmationId":1,"decision":"approve"}
   ↓
 ExecutionResumeService polling worker (2s tick)
   → Finds waiting + resumeReady row
   → Atomic claim: UPDATE SET serverNodeUUID=me, status='running'
-  → Rehydrates ExecutionContextImpl from checkpoint
+  → Rehydrates context in single Hibernate session
   → Reopens log writer in append mode (no second header)
-  → Enters EngineWorkflowExecutor.executeWorkflowResume
-    Phase A: re-invokes confirm step with resume payload
-      → Plugin reads ConfirmationPayload, logs "Confirmed by admin"
-      → Returns success
-    Phase B: runs remaining steps via normal engine
-      → Step 3 (DEPLOY) dispatched to local node → "DEPLOY-OK"
+  → Creates state listener via WorkflowService.createWorkflowStateListenerForExecution
+  → Enters EngineWorkflowExecutor.executeWorkflowResume:
+    beginWorkflowExecution → initializes state model
+    Replay: replayCompletedStep(1, true, "localhost") → Step 1 shown as SUCCEEDED
+    Phase A: beginWorkflowItem(2) → executeWFItem(confirm) → finishWorkflowItem(2)
+      → Plugin reads ConfirmationPayload, logs "[confirm] Confirmed by ..."
+      → Returns success → Step 2 shown as SUCCEEDED
+    Phase B: beginWorkflowItem(3) → executeWFItem(echo) → finishWorkflowItem(3)
+      → Step 3 dispatched to localhost → "Step 3 done"
+      → Step 3 shown as SUCCEEDED
+    finishWorkflowExecution → overall SUCCEEDED
   → Terminal write: status='succeeded', dateCompleted set
   → Suspend columns cleared (I11)
+  ↓
+API: GET /execution/{id} → status: "succeeded"
+API: GET /execution/{id}/state →
+  Overall: SUCCEEDED
+  Step 1: SUCCEEDED (localhost: SUCCEEDED)
+  Step 2: SUCCEEDED (localhost: SUCCEEDED)
+  Step 3: SUCCEEDED (localhost: SUCCEEDED)
+API: GET /execution/{id}/output → all log entries from both phases visible
+API: GET /execution/{id}/confirmations → [{confirmedBy:"...",decision:"approve",comment:"LGTM"}]
 ```
+
+**Deny path (also verified):** Step 1 SUCCEEDED → Step 2 FAILED (denied) → Step 3 NOT_STARTED → Overall FAILED.
 
 ---
 
@@ -237,14 +258,21 @@ Registered via `@JsonSubTypes` on the `ResumePayload` interface. Third-party plu
 
 **Resume execution:**
 1. Reload execution in a single Hibernate session (avoids lazy proxy issues)
-2. Parse checkpoint JSON → `ExecutionCheckpoint`
-3. Parse resume payload → `ResumePayload` (polymorphic Jackson)
-4. Rebuild auth context from frozen user + roles via `BaseAuthContextProvider`
-5. Reopen log writer in append mode via `LogFileStorageService.getLogFileWriterForResume`
-6. Build `ExecutionContextImpl` with resume payload + suspend metadata
-7. Build workflow item from execution's workflow data
-8. Call `EngineWorkflowExecutor.executeWorkflowResume` (two-phase: Phase A re-invokes suspended step, Phase B runs remaining steps via normal engine)
-9. On completion: write terminal state directly in the same Hibernate session
+2. `execution.refresh()` to sync version after raw SQL claim
+3. Parse checkpoint JSON → `ExecutionCheckpoint` (includes `completedStepResults`)
+4. Parse resume payload → `ResumePayload` (polymorphic Jackson)
+5. Rebuild auth context from frozen user + roles via `getAuthContextForUserAndRoles`
+6. Reopen log writer in append mode via `LogFileStorageService.getLogFileWriterForResume`
+7. Build log writer chain: `LoglevelThresholdLogWriter` → `ContextLogWriter` → `LoggerWithContext` (see §8.3)
+8. Create `ContextManager` for step/node context tracking
+9. Create `WorkflowExecutionListenerImpl` with the context-aware logger
+10. Create state listener via `WorkflowService.createWorkflowStateListenerForExecution`
+11. Combine `[contextmanager, baseListener, execStateListener, logOutFlusher, logErrFlusher]` into `MultiWorkflowExecutionListener`
+12. Build `ExecutionContextImpl` with resume payload + suspend metadata
+13. Install thread-bound stdout/stderr streams via `sysThreadBoundOut`/`sysThreadBoundErr`
+14. Call `EngineWorkflowExecutor.executeWorkflowResume` with 7-arg overload passing `execStateListener` (for state replay) and `localNodeName`
+15. In finally: tear down thread-bound streams, close log writer
+16. On completion: write terminal state directly in the same Hibernate session (avoids nested transaction version conflicts)
 
 **Timeout sweep (every 30 seconds):**
 - Finds `status='waiting' AND resume_ready=false AND wait_timeout_at <= now()`
@@ -266,43 +294,97 @@ Registered via `@JsonSubTypes` on the `ResumePayload` interface. Third-party plu
 
 Rule `STEP_SUSPENDED_END_WORKFLOW` transitions the workflow to end state when `step.any.state.suspended == true`. The processor loop exits naturally via `isWorkflowEndState()`.
 
+**Important:** The engine's rule-based `WorkflowEngineOperationsProcessor` does NOT guarantee result ordering in the result set. The suspended step may appear before completed steps. `onWorkflowSuspended` handles this by counting non-suspended results to derive the `suspendedStepIndex` and collecting `completedStepResults` by filtering on `!isSuspended()` rather than by position.
+
 ### 7.2 Resume path
 
-`EngineWorkflowExecutor.executeWorkflowResume()` uses a two-phase approach:
-- **Phase A:** Direct invocation of the suspended step via `executeWFItem` with the resume payload on the context. The step plugin sees `getResumePayload() != null`.
-- **Phase B:** Remaining steps executed via `executeWorkflowImpl` with a fresh context (no resume payload). This prevents payload leaking to non-suspended steps.
+`EngineWorkflowExecutor.executeWorkflowResume()` uses a two-phase approach with full lifecycle events:
+
+1. **`beginWorkflowExecution`** — fires on the listener to initialize the state model
+2. **Completed step replay** — for each step recorded in the checkpoint's `completedStepResults`, calls `WorkflowExecutionStateListenerAdapter.replayCompletedStep(step, success, nodeName)` to transition step states through `RUNNING → SUCCEEDED/FAILED` with proper node-level events. This is done via the state adapter directly (not the multi-listener) because `finishWorkflowItem` skips state notifications for node-dispatch steps.
+3. **Phase A:** Direct invocation of the suspended step via `executeWFItem` with the resume payload on the context. The step plugin sees `getResumePayload() != null`. Listener events (`beginWorkflowItem`/`finishWorkflowItem`) are fired around the call.
+4. **Phase B:** Remaining steps executed via direct `executeWFItem` calls in a loop (NOT via `executeWorkflowImpl`). Each step gets proper `beginWorkflowItem`/`finishWorkflowItem` listener events. Direct execution avoids the rule engine's cross-step condition resolution issue, where a sub-workflow can't resolve `after.step.N` conditions referencing steps from the original workflow.
+5. **`finishWorkflowExecution`** — fires in a `finally` block (suppressed for re-suspended results) to transition the state model to `SUCCEEDED`/`FAILED`.
+
+The two-arg overload `executeWorkflowResume(ctx, item, checkpoint, payload, metadata)` delegates to the seven-arg overload which also accepts a `WorkflowExecutionStateListenerAdapter` and `localNodeName` for state replay.
 
 ### 7.3 Listener suppression
 
-`BaseWorkflowExecutor.executeWorkflow()` suppresses `finishWorkflowExecution` listener callback when `result.isSuspended()` so the workflow is not marked as terminated.
+`BaseWorkflowExecutor.executeWorkflow()` suppresses `finishWorkflowExecution` listener callback when `result.isSuspended()` so the workflow is not marked as terminated. Similarly, `executeWorkflowResume()` suppresses `finishWorkflowExecution` when the result is re-suspended.
+
+### 7.4 State replay for completed steps
+
+`WorkflowExecutionStateListenerAdapter.replayCompletedStep(step, success, nodeName)` is a public method added for resume state replay. Unlike the normal `beginWorkflowItem`/`finishWorkflowItem` path, it fires state transitions directly regardless of whether the step is a node-dispatch step, including per-node `RUNNING → SUCCEEDED` transitions when `nodeName` is provided.
 
 ---
 
 ## 8. Log writer
 
+### 8.1 Suspend-close
+
 `FSStreamingLogWriter` implements `CheckpointableStreamingLogWriter`:
 - `suspend()`: flush + fsync + close WITHOUT writing `^END^` footer
 - Resume-mode constructor: `new FSStreamingLogWriter(stream, meta, format, true)` skips `outputBegin()` header
 
+`ExecutionUtilService.suspendExecution()` walks the log writer chain recursively via `findAndSuspendCheckpointableWriter()` to find the `FSStreamingLogWriter`. The chain traversal handles both `FilterStreamingLogWriter` delegates and `MultiLogWriter` fan-outs (the standard log writer chain is `ExecutionLogWriter → LoglevelThresholdLogWriter → MultiLogWriter → DisablingLogWriter → FSStreamingLogWriter`).
+
+### 8.2 Resume-open
+
 `LogFileStorageService.getLogFileWriterForResume(execution, meta)` opens the log file in append mode (`FileOutputStream(file, true)`) with `resumeMode=true`.
 
-Result: one header at original start, events from both pre-suspend and post-resume, one footer at final completion.
+### 8.3 Resume log writer chain
+
+The resume path mirrors the normal execution path's log writer chain:
+
+1. **`LoglevelThresholdLogWriter`** wraps the `ExecutionLogWriter` to filter debug/verbose framework messages (e.g., `[workflow] Begin step:`) from the execution log. Uses the job's configured log level (default INFO).
+2. **`ContextLogWriter`** wraps the filtered writer to stamp each log event with the current step/node context metadata (`stepctx`, `node`).
+3. **`LoggerWithContext`** combines the `ContextLogWriter` with a `ContextManager` into an `ExecutionLogger` used by `WorkflowExecutionListenerImpl`.
+4. **`ContextManager`** is included in the `MultiWorkflowExecutionListener` listener list so it receives step begin/end events and tracks the active step context.
+5. **Thread-bound stdout/stderr** — `sysThreadBoundOut`/`sysThreadBoundErr` are installed via `loggingService.createLogOutputStream()` with the filtered writer and context manager, so command stdout (e.g., `echo "Step 3 done"`) is captured in the execution log with proper step context.
+6. **`LogFlusher`** listeners are included in the multi-listener to flush stdout/stderr output after node steps.
+
+Result: one header at original start, events from both pre-suspend and post-resume with correct step context metadata, debug messages filtered, one footer at final completion. The nodes view shows only relevant output per step.
+
+### 8.4 Explicit suspend/resume trigger markers
+
+The execution log carries explicit workflow-level trigger lines so operators can see pause/resume transitions directly in the output view (without having to infer them from the rule engine's "Step N did not run" diagnostics).
+
+- **Suspend marker** — `ExecutionUtilService.suspendExecution()` calls `loghandler.log(...)` with a line of the form
+  `[suspend] Execution paused — reason: "<reason>", waiting for: <waitingFor>, timeout: <duration>`
+  before the writer is torn down. Fields come from the first `SuspendRequest` on the thread's result (`reason`, `waitingFor`, `timeoutMs`). `timeoutMs` is rendered as `1d2h30m` style via `formatDurationMs()`.
+- **Resume marker** — `ExecutionResumeService.resumeExecution()` calls `loghandler.log(...)` immediately after the log writer reopens, with a payload-aware message:
+  - `ConfirmationPayload` approve → `[resume] Execution resumed — approved by <user>: <comment>`
+  - `ConfirmationPayload` deny → `[resume] Execution resumed — denied by <user>: <comment>`
+  - `ConfirmationPayload` timeout → `[resume] Execution resumed — confirmation timed out`
+  - `OperatorResumePayload` → `[resume] Execution resumed — operator resume by <user>[: <comment>]`
+  - Unknown subtype → `[resume] Execution resumed — payload: <type>`
+
+Both markers go through `ExecutionLogWriter.log(...)` at NORMAL level, so they survive the `LoglevelThresholdLogWriter` filter, land without `stepctx` metadata (workflow-level, not attached to any step), and appear inline in the output view between pre-suspend and post-resume content.
+
+Note: the rule engine's "Step N did not run" warnings still print above the `[suspend]` line because they're emitted during workflow tear-down, before `suspendExecution()` runs. They are left in place as additional diagnostics.
 
 ---
 
 ## 9. UI
 
-### 9.1 Execution detail page (show.gsp)
+### 9.1 Execution detail page (UIPlugin)
 
-- **Confirmation panel:** Yellow "Waiting for Confirmation" panel with message, comment field, Approve (green) and Deny (red) buttons.
-- **Dynamic appearance:** Panel is hidden initially. A JavaScript poller checks execution status every 2 seconds. When status becomes `waiting`, the panel slides in via jQuery `slideDown()`.
-- **CSRF authentication:** CSRF token read directly from embedded `g:jsonToken` element and injected as `X-RUNDECK-TOKEN-KEY`/`X-RUNDECK-TOKEN-URI` headers on AJAX calls.
-- **Feedback:** "Approved! Resuming..." or "Denied!" with auto-page-reload after 3 seconds.
+The confirmation UI is rendered entirely by the `ConfirmUIPlugin` — a `UIPlugin` that injects JS/CSS at the `execution/show` path. No modifications to show.gsp are required.
+
+- **`ConfirmUIPlugin.java`** — applies at `execution/show`, loads `confirm-execution.js` and `confirm-execution.css`
+- **`confirm-execution.js`** — polls `/api/{v}/execution/{id}/confirm/status`, renders a card panel with message, comment field, Approve/Deny buttons when the execution is waiting
+- **Styling:** Uses Rundeck's native `card`, `btn btn-success`, `btn btn-danger`, `form-control` CSS classes to inherit the page theme
+- **CSRF authentication:** Reads the existing `exec_cancel_token` `g:jsonToken` element on the page and injects `X-RUNDECK-TOKEN-KEY`/`X-RUNDECK-TOKEN-URI` headers via jQuery `beforeSend`
+- **jQuery:** Uses jQuery (already loaded by Rundeck) for AJAX calls, matching Rundeck's existing patterns
+- **Feedback:** "Approved! Resuming..." or "Denied!" with auto-page-reload after 3 seconds
+
+This architecture means each HIL primitive (choose, ask, review, attest, rank) can ship as a self-contained plugin JAR with its own UIPlugin + JS/CSS rendering — no upstream GSP changes needed.
 
 ### 9.2 Activity list (activityList.vue)
 
 - `waiting` status recognized in `executionState()` method
 - Orange pause icon (`fas fa-pause-circle text-warning`) for waiting executions
+- Static orange progress bar with "Waiting for confirmation" label (not the animated barber pole)
 - Row class `nowwaiting` (not `nowrunning`) so it doesn't show the running animation
 - Bulk-delete checkbox disabled for waiting executions
 
@@ -312,6 +394,12 @@ Result: one header at original start, events from both pre-suspend and post-resu
 - Step state: `WAITING` (not `FAILED`)
 - Message: "Waiting for confirmation" (not "step suspended: awaiting confirmation")
 - No failure metadata for suspended steps
+
+After resume completes, all step states reflect their actual outcome:
+- Steps before suspend: `SUCCEEDED` (replayed via `replayCompletedStep`)
+- Suspended step: `SUCCEEDED` or `FAILED` (from Phase A result)
+- Steps after suspend: `SUCCEEDED` or `FAILED` (from Phase B execution)
+- Overall: `SUCCEEDED` or `FAILED` (from `finishWorkflowExecution`)
 
 ---
 
@@ -350,14 +438,38 @@ Issues found and fixed during live testing on a running Rundeck instance:
 | 11 | Browser 404 on approve (no CSRF token) | Direct token injection from `g:jsonToken` DOM element |
 | 12 | `moduleResolution: "node"` can't resolve `@primeuix/themes/lara` | Changed to `"bundler"` in all 3 tsconfigs |
 | 13 | PD-internal npm registry URLs in lockfiles | Rewrite to public registry URLs via sed |
+| 14 | Step 2 state `FAILED` instead of `WAITING` during suspend | `WorkflowExecutionStateListenerAdapter` checks `isSuspended()` first |
+| 15 | Step states stale after resume (Steps 1/2 show `WAITING`/`NOT_STARTED`) | `replayCompletedStep()` fires synthetic state transitions including node-level events |
+| 16 | Step 3 not executing during resume (rule engine condition unresolvable) | Replace Phase B `executeWorkflowImpl` with direct `executeWFItem` loop |
+| 17 | Resume log output missing from execution log | Use `ExecutionLogger` wrapping `loghandler` instead of server-log stub |
+| 18 | Log writer suspend can't find `FSStreamingLogWriter` through `MultiLogWriter` | Recursive traversal handling `MultiLogWriter` fan-outs |
+| 19 | Premature `^END^` footer written on suspend | Fixed by #18 — `CheckpointableStreamingLogWriter.suspend()` now reached correctly |
+| 20 | Overall execution state `RUNNING` after resume completion | Fire `finishWorkflowExecution` in `executeWorkflowResume` finally block |
+| 21 | `completedStepResults` empty in checkpoint | Populate from `result.getResultSet()` in `onWorkflowSuspended` |
+| 22 | `WorkflowExecutionListenerImpl` constructor mismatch on resume | Use `ExecutionLogger` anonymous class, not `ExecutionLogWriter` directly |
+| 27 | Resumed executions missing from activity/history page | Call `logExecution()` in resume path to write execution report |
+| 28 | Confirm log message shows empty `(roles: [])` | Remove roles from log format string in `ConfirmWorkflowStep` |
+| 29 | Confirm output variables not available in subsequent steps | Plugin writes to both outputContext and sharedDataContext; engine merges shared context back after each phase |
+| 30 | Confirmation UI hardcoded in show.gsp (not upstream-safe) | Refactored to UIPlugin: `ConfirmUIPlugin` + `confirm-execution.js` + CSS, no GSP changes needed |
+| 31 | UIPlugin panel not appearing dynamically on waiting | Poll execution status first, then fetch confirm/status; add `X-Rundeck-Ajax` header to GET calls |
+| 32 | UIPlugin approve button returning "Not found" | Switch from fetch API to jQuery; read CSRF token from existing `exec_cancel_token` element |
+| 33 | Approved executions show splat icon in activity list | Use `EXECUTION_SUCCEEDED`/`EXECUTION_FAILED` constants instead of `'true'`/`'false'` in resume terminal write |
+| 23 | `completedStepResults` flaky (0 or 1) due to non-deterministic result set ordering | Don't assume suspended step is last in result set; count completed results instead |
+| 24 | Resumed log entries lack `stepctx` metadata (nodes view can't attribute to steps) | Wire `ContextManager` + `ContextLogWriter` + `LoggerWithContext` in resume path |
+| 25 | Command stdout not captured in resume path | Install thread-bound stdout/stderr via `sysThreadBoundOut`/`sysThreadBoundErr` |
+| 26 | Verbose `[workflow]` framework messages in nodes view | Add `LoglevelThresholdLogWriter` to filter debug/verbose from execution log |
 
 ---
 
 ## 12. Known limitations / follow-ups
 
-### 12.1 Stale workflow state after resume
+### 12.1 ~~Stale workflow state after resume~~ — RESOLVED
 
-After resume completes, the per-node and per-step state indicators in the execution detail page show stale data (node spinner "running", post-confirm steps show "Waiting"). The resume path uses a simplified listener (`WorkflowExecutionListenerImpl` with a stub logger) that doesn't feed into the persisted workflow state model. Fix: wire the resume path through the real `WorkflowExecutionStateListenerAdapter` or update state after resume completes.
+~~After resume completes, the per-node and per-step state indicators show stale data.~~ Fixed by:
+- Firing `beginWorkflowExecution` / `finishWorkflowExecution` lifecycle events in `executeWorkflowResume`
+- Replaying completed steps via `WorkflowExecutionStateListenerAdapter.replayCompletedStep()` with node-level events
+- Using direct `executeWFItem` calls in Phase B instead of `executeWorkflowImpl` (avoids rule engine cross-step condition issues)
+- Wiring the resume path through the real `WorkflowExecutionStateListenerAdapter` via `WorkflowService.createWorkflowStateListenerForExecution`
 
 ### 12.2 Confirm panel requires page load on `waiting`
 
@@ -379,13 +491,37 @@ Workflows using `ParallelWorkflowStrategy` cannot suspend. Multi-step quiesce is
 
 The pause/resume API endpoints work but there are no Pause/Resume buttons in the execution detail page. Operator pause is API-only.
 
-### 12.7 Execution log output for resumed steps
+### 12.7 ~~Execution log output for resumed steps~~ — RESOLVED
 
-The log output from resumed steps (Phase B) is captured by the stub logger and written to the server log, but may not appear in the execution's log file correctly because the log writer chain is simplified on resume.
+~~Log output from resumed steps was only in the server log.~~ Fixed by:
+- Building a full log writer chain: `LoglevelThresholdLogWriter` → `ContextLogWriter` → `LoggerWithContext` with `ContextManager` for step context stamping
+- Installing thread-bound stdout/stderr streams so command output is captured with correct `stepctx` metadata
+- Fixing `ExecutionUtilService.suspendExecution()` to recursively traverse `MultiLogWriter` fan-outs when finding the `CheckpointableStreamingLogWriter`, preventing premature `^END^` footer
+- Filtering debug/verbose framework messages (e.g., `[workflow] Begin step:`) via `LoglevelThresholdLogWriter` so only relevant output appears in the nodes view
+- The resume path now appends cleanly: one `^text/x-rundeck-log-v2.0^` header, events from both pre-suspend and post-resume with correct step context, debug messages filtered, one `^END^` footer
 
 ### 12.8 PagerDuty npm registry dependency
 
 Building the UI requires either `CLOUDSMITH_NPM_TOKEN` for the PD internal registry, or the workaround: rename `.npmrc` files, rewrite lockfile registry URLs via `sed`, and change `moduleResolution` to `"bundler"` in tsconfig files.
+
+### 12.9 ~~Confirm step does not export output variables~~ — RESOLVED
+
+The confirm plugin now exports confirmation data as output variables on the resume path. Subsequent steps reference them as:
+
+| Variable | Description |
+|---|---|
+| `${confirm.decision}` | `approve` or `deny` |
+| `${confirm.comment}` | Comment entered by the confirmer |
+| `${confirm.confirmedBy}` | Username of the confirmer |
+| `${confirm.confirmedAt}` | Timestamp of confirmation |
+
+Example Step 3: `echo "Approved by: ${confirm.confirmedBy}, comment: ${confirm.comment}"`
+
+Implementation: the plugin writes to both `pluginContext.getOutputContext().addOutput(ContextView.global(), ...)` and directly to `context.getSharedDataContext().merge(ContextView.global(), ...)`. The engine's `executeWorkflowResume` merges the step's shared context back into the parent after each phase so subsequent steps see the data.
+
+### 12.10 Confirmer identity shows "unknown"
+
+The `confirmedBy` field in audit records and log output shows "unknown" when using API token authentication. The `ApiConfirmController` doesn't extract the authenticated username from the API token auth context. Browser session auth is not currently used for the confirm API calls.
 
 ---
 
@@ -414,7 +550,7 @@ Building the UI requires either `CLOUDSMITH_NPM_TOKEN` for the PD internal regis
 - `plugins/confirm-plugin/src/main/java/.../ConfirmWorkflowStep.java`
 
 **Grails:**
-- `ExecutionResumeService.groovy` — polling worker + resume logic
+- `ExecutionResumeService.groovy` — polling worker + resume logic; `buildResumeMarker()` emits explicit `[resume]` trigger line (§8.4)
 - `ApiConfirmController.groovy` — confirm API endpoints
 - `ApiOperatorPauseController.groovy` — pause API endpoints
 - `ExecutionConfirmation.groovy` — audit trail domain
@@ -456,12 +592,12 @@ Building the UI requires either `CLOUDSMITH_NPM_TOKEN` for the PD internal regis
 - `StepPluginAdapter.java` — `pendingSuspension` detection
 - `BaseWorkflowExecutor.java` — `BaseWorkflowExecutionResult` suspend fields, listener suppression
 - `WorkflowExecutionServiceThread.java` — `isSuspended()` accessor
-- `WorkflowExecutionStateListenerAdapter.java` — WAITING state for suspended steps
+- `WorkflowExecutionStateListenerAdapter.java` — WAITING state for suspended steps, `replayCompletedStep()` for resume state replay
 - `AuthConstants.java` — `ACTION_CONFIRM`, `ACTION_PAUSE`
 - `Execution.groovy` — 9 new fields, criteria exclusion, state mapping
 - `ExecutionService.groovy` — `EXECUTION_WAITING`, `onWorkflowSuspended()`, `pauseCheckSupplier` wiring, notification event
 - `ExecutionJob.groovy` — suspended branch, skip terminal write
-- `ExecutionUtilService.groovy` — `suspendExecution()` log writer suspend
+- `ExecutionUtilService.groovy` — `suspendExecution()` with recursive `MultiLogWriter` traversal, `buildSuspendMarker()` for explicit `[suspend]` trigger line (§8.4)
 - `FSStreamingLogWriter.groovy` — `CheckpointableStreamingLogWriter`, `suspend()`, `resumeMode`
 - `LogFileStorageService.groovy` — `getLogFileWriterForResume()`
 - `Application.groovy` — `@EnableScheduling`

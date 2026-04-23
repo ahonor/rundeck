@@ -198,7 +198,9 @@ class ApiConfirmController {
         render([
                 waiting: isWaitingConfirmation,
                 currentStatus: execution.status,
+                source: metadata.get('source'),
                 message: metadata.get('message'),
+                criticality: metadata.get('criticality'),
                 decisionSet: metadata.get('decisionSet'),
                 requiredConfirmerRoles: metadata.get('requiredConfirmerRoles'),
                 waitStartedAt: execution.waitStartedAt?.toInstant()?.toString(),
