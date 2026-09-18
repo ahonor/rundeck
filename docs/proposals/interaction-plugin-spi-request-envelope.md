@@ -1,160 +1,127 @@
-# InteractionPlugin SPI — the request envelope composes the engine type
+# InteractionPlugin SPI — implementation notes and one open question
 
-**Status:** Decided, implemented, open to pushback
+**Status:** Implemented; one decision left for the Rundeck team
 **Author:** Alex Honor
 **For:** Luis Toledo, Rundeck team
-**Amends:** `docs/proposals/interaction-plugin-spi.md` §5.1, §5.4, §5.5, §5.7
-**Branch:** `pr/interaction-plugin-spi` (based on `3bb960df0f`)
+**Amends:** `docs/proposals/interaction-plugin-spi.md` §5.1, §5.5, §5.7, §5.8, §5.9
+**Branch:** `pr/upstream-submission` — one commit on `3bb960df0f`
 
 ---
 
-## Summary
+## What this note is
 
-The proposal specified `HILRequest extends SuspendRequest`. Porting it onto current
-`main` showed that subclassing doesn't survive contact with the persistence path, so
-the SPI now **composes** the engine type instead: `HILRequest` produces a
-`SuspendRequest` via `toSuspendRequest()`.
+The proposal specifies the SPI. This note records the two design decisions taken while
+turning it into working code, the evidence behind each, and the one question that is
+genuinely yours rather than mine.
 
-The result is a PR that modifies **no existing file**:
+The branch is 73 files and 7,029 insertions: the engine suspend/resume primitive, the
+`InteractionPlugin` contract, and the confirm step as its first implementation. It
+modifies no existing file that upstream has changed since, and the core test suite
+passes. It is the whole feature, not a slice — the design is easier to judge with a
+consumer attached.
 
-- 13 new files, 1,140 insertions, 0 modifications
-- `:core:compileJava` → `BUILD SUCCESSFUL`
-- `HILRequestRoundTripSpec` → 4 tests, 4 passing
+## Decision 1 — the request envelope composes `SuspendRequest`
 
-Staleness isn't a factor. The original work branched from `280ecc5702` (9 April 2026)
-and is ~1,250 commits behind, but none of that churn touches this surface.
+The proposal originally had `HILRequest extends SuspendRequest`. Porting it onto
+current `main` showed that subclassing does not survive the persistence path. Three
+problems, lightest first.
 
-## Why subclassing didn't work
+**`SuspendRequest` is final.** `SuspendRequest.java:53` declares
+`public final class SuspendRequest`. Extending it means unsealing an engine type that
+non-HIL consumers share. It also inherits a trap: the parent's `equals`/`hashCode`
+cover its own six fields, so subclasses adding fields get value semantics that ignore
+them — two `ConfirmRequest`s differing only in `decisionSet` would compare equal.
 
-Three problems, lightest first.
-
-### 1. `SuspendRequest` is final
-
-`SuspendRequest.java:53` declares `public final class SuspendRequest`. Extending it
-means unsealing it — modifying an engine type that non-HIL consumers already share.
-
-It also inherits a trap: `SuspendRequest` is an immutable value type whose `equals`,
-`hashCode` and `toString` cover its own six fields. Subclasses that add fields get
-value semantics that silently ignore them — two `ConfirmRequest` instances differing
-only in `decisionSet` would compare equal.
-
-### 2. The static `builder()` collides
-
-A hard compile error:
+**The static `builder()` collides.** A hard compile error:
 
 ```
 error: builder() in ConfirmRequest cannot hide builder() in SuspendRequest
   return type ConfirmRequest.Builder is not compatible with SuspendRequest.Builder
 ```
 
-`SuspendRequest` exposes `static Builder builder()`, so every concrete primitive
-subtype would have to pick a different name.
+Every concrete primitive would need a differently-named builder.
 
-### 3. Typed fields don't survive a resume
-
-This is the one that settled it.
-
-`ResumePayload` carries the polymorphism machinery — `@JsonTypeInfo` plus
-`@JsonSubTypes`. `SuspendRequest` carries none of it. But it is persisted and read
-back:
+**Typed fields would not survive a resume.** This is the one that settled it.
+`ResumePayload` carries `@JsonTypeInfo` and `@JsonSubTypes`; `SuspendRequest` carries
+neither. But it is persisted and read back:
 
 - `ExecutionCheckpoint.java:62` — `private final SuspendRequest suspendRequest;`
 - `ExecutionResumeService.groovy:211` — `objectMapper.readValue(execution.checkpointData, ExecutionCheckpoint)`
 
-So a `ConfirmRequest` written into a checkpoint would come back as a plain
-`SuspendRequest`, dropping `message`, `criticality`, `source`, `decisionSet` and
-`requiredConfirmerRoles`.
+A `ConfirmRequest` written into a checkpoint would return as a plain `SuspendRequest`,
+dropping `message`, `criticality`, `source`, `decisionSet` and
+`requiredConfirmerRoles`. And `validateResponse()` — declared on `HILRequest`, reading
+`decisionSet` — would be unreachable after resume, which §7's validation rules depend
+on.
 
-The follow-on: `validateResponse()` is declared on `HILRequest` and reads
-`decisionSet`. After a resume the engine would hold a `SuspendRequest`, not a
-`HILRequest`, so the method would be unreachable — and §7's engine validation rules
-depend on it being callable on every response before dispatch.
+The proposal's §3 goal, "reuse existing engine surfaces, introduce no parallel
+polymorphism machinery," is right. But only the *response* half of that machinery
+exists. Subclassing assumed a request half that is not there.
 
-The proposal's §3 goal — "reuse existing engine surfaces, do not introduce parallel
-polymorphism machinery" — is right. But only the *response* half of that machinery
-exists today. Subclassing assumed a request half that isn't there.
+**So `HILRequest` produces a `SuspendRequest` instead of being one,** and roots its own
+Jackson polymorphism on a `"primitive"` discriminator, registered through the existing
+`JacksonSubtypeRegistrar`. `SuspendRequest` is untouched — byte-identical to what the
+engine change introduces. All three problems disappear. The cost is one unwrap call,
+`request.toSuspendRequest()`, at a boundary the engine already owns.
 
-## What the SPI does instead
+**The alternative, for the record:** add `@JsonTypeInfo` to `SuspendRequest` and keep
+inheritance. It preserves the original hierarchy, but changes the serialized form of a
+type operator-pause and future suspendable plugins also use, and leaves the first two
+problems as permanent papercuts for every primitive author. If you would rather keep
+the hierarchy at that price, the change is contained.
 
-`HILRequest` is the polymorphism root for the request family, mirroring how
-`ResumePayload` roots the response family:
+## Decision 2 — no new plugin service
 
-```java
-@Experimental
-@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.PROPERTY, property = "primitive")
-@JsonSubTypes({ @JsonSubTypes.Type(value = ConfirmRequest.class, name = HILPrimitives.CONFIRM) })
-public abstract class HILRequest implements Serializable {
+The proposal had interaction plugins register under a new `"Interaction"` service.
+The implementation does not. They register under the existing `WorkflowStep` service
+and implement both `StepPlugin` and `InteractionPlugin`; `StepPluginAdapter` prefers
+the typed contract when a plugin offers it.
 
-    @JsonIgnore
-    public abstract String getPrimitive();
+The reason is that a workflow step's plugin service is not stored in the job
+definition — it is derived. `WorkflowController` resolves
+`isNodeStep ? WorkflowNodeStep : WorkflowStep`, and `PluginStep` carries only
+`Boolean nodeStep` and `String type`. There is no third state.
 
-    public final SuspendRequest toSuspendRequest() { ... }
+So `"Interaction"` as a step-hosting service means changing how a job records what a
+step is: a job definition format change, cascading into the `PluginStep` domain and a
+migration, job XML/YAML import/export, every `isNodeStep ?` branch,
+`ScheduledExecutionService` validation, and SCM export/import — job definitions being
+what SCM versions. An older Rundeck would not read a job containing an interaction
+step.
 
-    protected Map<String, Object> suspendMetadata() { return Collections.emptyMap(); }
+That is a backward-compatibility surface, and it is separable from the contract. This
+branch gets the typed SPI, its persistence behavior and its engine validation without
+any of it.
 
-    public List<String> validateResponse(HILResponse response) { return Collections.emptyList(); }
-}
-```
+**What that defers:** interaction steps have no dedicated job-edit palette category,
+so they appear among ordinary workflow steps; and recognition is by `instanceof` at
+dispatch rather than by registration, so nothing prevents a class implementing the
+interface without the engine knowing. Both are real, neither is a contract problem.
 
-Four consequences worth naming:
+## What the implementation added beyond the proposal
 
-- **No engine type changes.** `SuspendRequest` stays final and byte-identical to what
-  the engine PR introduces. The unsealing, the value-semantics trap and the builder
-  collision all disappear.
-- **Typed fields survive persistence,** because the discriminator lives on a type we
-  fully own. `HILRequestRoundTripSpec` asserts this directly.
-- **No parallel machinery.** Third-party primitives register subtypes through the
-  existing `JacksonSubtypeRegistrar`, the same hook `ResumePayload` subtypes use.
-- **`suspendMetadata()` keeps the existing consumers working.** REST controllers and
-  the paused-step UI read `SuspendRequest.getMetadata()` today; concrete requests
-  project their fields into it. The typed object stays the source of truth, the map
-  is a view of it.
+| Addition | Why |
+|---|---|
+| `HILRequest.METADATA_KEY` (`"hilRequest"`) and `fromSuspendMetadata(Map)` | The typed request has to reach the resume path, but `StepExecutionContext` exposes only `getResumePayload()` and `getSuspendMetadata()`. `toSuspendRequest()` serializes the request into envelope metadata; the resume path resolves it back through the discriminator. No schema change, no new accessor. |
+| `timeoutAction` on `ConfirmRequest` | It must be frozen at suspend time. The typed request is a better home for it than the untyped metadata map. |
+| `@JsonIgnore` on `getPrimitive()` | Without it Jackson emits a `primitive` property the creator does not accept, and every response fails to deserialize. Found by the round-trip tests. Same fix `ResumePayload.getType()` already carries. |
+| `ConfirmResponse` supersedes `ConfirmationPayload` | Two `ResumePayload` subtypes cannot share the `"confirmation"` discriminator. Field sets were identical, so the change was mechanical. |
 
-The cost is one unwrap at the suspend boundary — the engine calls
-`hilRequest.toSuspendRequest()` rather than passing the object straight through. That
-lands in the engine PR, which is touching dispatch anyway.
-
-**The alternative we rejected:** mirror `@JsonTypeInfo` onto `SuspendRequest` and keep
-inheritance. It preserves the proposal's hierarchy and leaves
-`StepExecutionContext.suspend()` untouched, but it changes the serialized form of a
-type operator-pause and future suspendable plugins also use — a persistence-format
-change — and it leaves problems 1 and 2 as permanent papercuts for every primitive
-author. If you'd rather keep `suspend()` signature-stable at that price, say so and
-I'll switch it back; the change is contained.
-
-## Smaller items, resolved
-
-| Item | Finding | Resolution |
-|---|---|---|
-| Discriminator collision | `ConfirmResponse` uses `@JsonTypeName("confirmation")`, already claimed by `ConfirmationPayload` in `ResumePayload`'s `@JsonSubTypes` | `ConfirmResponse` replaces `ConfirmationPayload`; stated explicitly in the proposal |
-| `HILResponse` shape | §5.2 calls it an abstract class, §5.6 declares an interface | Interface — it extends `ResumePayload`, which is an interface |
-| `@Experimental` | As written it is self-annotated and has no `@Retention`/`@Target` | Written with `@Documented`, `@Retention(CLASS)`, `@Target({TYPE, METHOD, FIELD, CONSTRUCTOR})` |
-
-## PR split
-
-The compiler drew the seam. `SuspendedStepResult` can't go in an SPI-only PR — it
-implements `isSuspended()` and `getSuspendRequest()`, which are default methods added
-to the `StepExecutionResult` interface. That's a modification to an existing engine
-type, so it belongs with the engine change.
-
-1. **PR 1 — SPI contract.** `plugins/interaction/*` plus the `suspend` value types
-   (`SuspendRequest`, `ResumePayload`, `JacksonSubtypeRegistrar`). All new files,
-   compiles standalone, no behavior change. This is what's on the branch now.
-2. **PR 2 — engine suspend/resume.** `StepExecutionResult` defaults, checkpointing,
-   engine loop, lifecycle and schema.
-3. **PR 3 — confirm implementation.** The plugin, REST surface, ACL, UI.
-
-One open question on PR 1's boundary: `ResumePayload`'s `@JsonSubTypes`
-hard-references `ConfirmationPayload` and `OperatorResumePayload`, which pulls both
-into PR 1 even though operator-pause is a PR 3 concern. Leaving `@JsonSubTypes` empty
-and relying on `JacksonSubtypeRegistrar` would keep PR 1 to the contract alone. Happy
-to go either way.
+The metadata carrier is the one mechanism I invented rather than ported, so it is the
+part most worth your scrutiny. The alternative is exposing the suspend payload on
+`StepExecutionContext` and storing the request there — cleaner conceptually, but it
+widens an engine interface for a case only this SPI has so far.
 
 ## What I'd like from you
 
-1. Does the composed shape work for you, or would you rather keep
-   `StepExecutionContext.suspend()` signature-stable and pay the inheritance costs?
-2. Does the three-PR split match how you'd want to review this?
-3. Does the `@JsonSubTypes` question change PR 1's file set?
+1. **Is `"Interaction"` worth a job definition format change?** This is the real
+   question. The branch works without it; what it costs is the palette category and
+   registry-level enforcement. You are far better placed than I am to weigh that
+   against the compatibility surface, and against the fact that
+   `ServiceNameConstants` has not gained an entry since `PluginGroup` in March 2022.
+2. **Does the composed envelope hold up,** or would you rather keep the original
+   hierarchy and annotate `SuspendRequest`?
+3. **Is the metadata carrier the right mechanism,** or should `StepExecutionContext`
+   expose the suspend payload directly?
 
-I'll rework the branch to whatever you land on before opening anything.
+I'll rework the branch to whatever you land on.
