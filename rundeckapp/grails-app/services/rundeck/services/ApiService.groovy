@@ -788,6 +788,11 @@ class ApiService implements WebUtilService{
             if(execdata.customStatus){
                 execMap['customStatus']=execdata.customStatus
             }
+            // Wave 6 cycle/workflow-suspend-resume: expose suspendType so
+            // the activity list can distinguish operator-pause from confirmation.
+            if(execdata.suspendType){
+                execMap['suspendType']=execdata.suspendType
+            }
                 /** elements   */
                 execMap.user=(e.user)
                 execMap.'date-started'=[unixtime: e.dateStarted.time, date: w3cDateValue(e.dateStarted)]

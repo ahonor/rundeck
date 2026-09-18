@@ -459,6 +459,11 @@ class ExecutionService implements ApplicationContextAware, StepExecutor, NodeSte
                 if(e.customStatusString){
                     data.customStatus=e.customStatusString
                 }
+                // Expose suspend type so the activity list can distinguish an
+                // operator-initiated pause from a confirmation suspension.
+                if(e.suspendType){
+                    data.suspendType=e.suspendType
+                }
                 if(e.retryExecution){
                     data.retryExecution=[
                             id:e.retryExecution.id,
@@ -1432,6 +1437,24 @@ class ExecutionService implements ApplicationContextAware, StepExecutor, NodeSte
                     )
                     .build()
 
+            // Wave 6: wire the pauseCheckSupplier so the engine's
+            // StepCallable can detect operator-pause requests from the DB
+            // between step invocations. The supplier reads pause_requested
+            // from the Execution row on each call.
+            if (executioncontext instanceof ExecutionContextImpl) {
+                final long execId = execution.id
+                ((ExecutionContextImpl) executioncontext).setPauseCheckSupplier({
+                    try {
+                        return Execution.withNewSession {
+                            Execution e = Execution.get(execId)
+                            return e?.pauseRequested ?: false
+                        }
+                    } catch (Exception ex) {
+                        return false
+                    }
+                })
+            }
+
             fileUploadService.executionBeforeStart(
                     new ExecutionPrepareEvent(
                             execution: execution,
@@ -1720,6 +1743,13 @@ class ExecutionService implements ApplicationContextAware, StepExecutor, NodeSte
     public static String EXECUTION_SCHEDULED = "scheduled"
     public static String EXECUTION_MISSED = "missed"
     public static String EXECUTION_QUEUED = "queued"
+    /**
+     * Wave 2 cycle/workflow-suspend-resume: non-terminal state in which the
+     * execution has released its JVM thread and is persisted in the database
+     * pending delivery of an external event. See spec §2.2 in
+     * docs/specs/workflow-suspend-resume.md.
+     */
+    public static String EXECUTION_WAITING = "waiting"
 
     public static String ABORT_PENDING = "pending"
     public static String ABORT_ABORTED = "aborted"
@@ -3472,6 +3502,124 @@ class ExecutionService implements ApplicationContextAware, StepExecutor, NodeSte
         triggerJobCompleteNotifications(execmap, event)
 
         return event
+    }
+
+    /**
+     * Wave 2 cycle/workflow-suspend-resume. Persist the execution as
+     * {@code waiting} after the engine loop observed a suspended step
+     * result. This is the non-terminal equivalent of saveExecutionState:
+     *
+     *   - Does NOT set dateCompleted (the execution is not terminal).
+     *   - Does NOT fire completion notifications (invariant I4).
+     *   - Clears serverNodeUUID to NULL (unowned-on-suspend model, §9.1).
+     *   - Sets wait_started_at to now, wait_timeout_at to now + timeoutMs.
+     *   - Serializes a minimal ExecutionCheckpoint blob via Jackson and
+     *     stores it in checkpoint_data. Wave 4 expands the blob with
+     *     completed step results, context data, and rehydration state.
+     *   - Persists the SuspendRequest's framework-visible metadata into
+     *     suspend_metadata for consumer API controllers to read.
+     *
+     * Log-writer suspend (flush + close without footer) is performed by
+     * the caller (ExecutionJob) BEFORE invoking this method, via
+     * executionUtilService.suspendExecution(execmap). See spec §4 I5 for
+     * the ordering contract.
+     *
+     * @param execmap the AsyncStarted returned by executeAsyncBegin
+     * @param result  the suspended WorkflowExecutionResult
+     * @return the updated Execution, or null on failure
+     */
+    Execution onWorkflowSuspended(
+            AsyncStarted execmap,
+            com.dtolabs.rundeck.core.execution.workflow.WorkflowExecutionResult result
+    ) {
+        if (execmap?.execution == null || result == null || !result.isSuspended()) {
+            log.warn("onWorkflowSuspended called without a suspended result; ignoring")
+            return null
+        }
+        long execId = execmap.execution.id
+        List<com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest> suspendRequests = result.getSuspendRequests()
+        com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest primary = suspendRequests.isEmpty() ? null : suspendRequests.get(0)
+        long timeoutMs = primary != null ? primary.getTimeoutMs() : 0L
+        // Build completed step results from the result set. The engine's
+        // rule-based processor does NOT guarantee result ordering — the
+        // suspended step may appear before completed steps. Collect all
+        // non-suspended entries and count them to derive the suspended
+        // step's 0-based index in the workflow command list (== the
+        // number of completed steps before it).
+        def resultSet = result.getResultSet()
+        def completedStepResults = []
+        if (resultSet != null) {
+            int completedIdx = 0
+            for (stepResult in resultSet) {
+                if (!stepResult.isSuspended()) {
+                    completedStepResults << new com.dtolabs.rundeck.core.execution.workflow.suspend.ExecutionCheckpoint.CompletedStepResult(
+                        completedIdx, stepResult.isSuccess(), [:])
+                    completedIdx++
+                }
+            }
+        }
+        // The suspended step index is the count of completed steps
+        // (i.e., it's the next step after all completed ones).
+        int suspendedStepIndex = completedStepResults.size()
+
+        def checkpoint = new com.dtolabs.rundeck.core.execution.workflow.suspend.ExecutionCheckpoint(
+                com.dtolabs.rundeck.core.execution.workflow.suspend.ExecutionCheckpoint.CURRENT_VERSION,
+                suspendedStepIndex,
+                primary,
+                null,   // context data: Wave 4 populates
+                null,   // checkpointable components: Wave 4 populates
+                completedStepResults
+        )
+
+        def objectMapper = new com.fasterxml.jackson.databind.ObjectMapper()
+        String checkpointJson = objectMapper.writeValueAsString(checkpoint)
+        String metadataJson = null
+        if (primary != null && primary.getMetadata() != null && !primary.getMetadata().isEmpty()) {
+            metadataJson = objectMapper.writeValueAsString(primary.getMetadata())
+        }
+
+        Date now = new Date()
+        Date timeoutAt = timeoutMs > 0 ? new Date(now.time + timeoutMs) : null
+
+        Execution.withNewTransaction {
+            Execution e = Execution.get(execId)
+            if (e == null) {
+                log.error("onWorkflowSuspended: execution ${execId} not found")
+                return
+            }
+            e.status = EXECUTION_WAITING
+            e.serverNodeUUID = null
+            e.waitStartedAt = now
+            e.waitTimeoutAt = timeoutAt
+            e.resumeReady = false
+            e.resumePayload = null
+            e.checkpointData = checkpointJson
+            e.suspendMetadata = metadataJson
+            e.save(flush: true)
+            log.info("Execution ${execId} suspended at step ${suspendedStepIndex + 1} (timeout at ${timeoutAt ?: 'never'}, completedSteps=${completedStepResults.size()})")
+        }
+
+        // Fire notification event AFTER the DB transaction commits (spec §4
+        // I5 step 7). The notification trigger type matches the suspend
+        // metadata type: 'waiting' for generic suspensions, or a more
+        // specific name if the metadata specifies one (e.g., for future
+        // consumer plugins). Job definitions can configure 'onwaiting'
+        // notifications to subscribe.
+        def execution = Execution.get(execId)
+        if (execution?.scheduledExecution) {
+            try {
+                String notifTrigger = 'waiting'
+                notificationService.asyncTriggerJobNotification(
+                        notifTrigger,
+                        execution.scheduledExecution.uuid,
+                        [execution: execution]
+                )
+                log.debug("Fired '${notifTrigger}' notification for execution ${execId}")
+            } catch (Exception notifEx) {
+                log.warn("Failed to fire waiting notification for execution ${execId}: ${notifEx.message}")
+            }
+        }
+        return execution
     }
 
     /**

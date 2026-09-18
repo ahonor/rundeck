@@ -236,7 +236,7 @@
             v-for="exec in running.executions"
             :key="exec.id"
             class="execution link activity_row autoclickable"
-            :class="{ nowrunning: !exec.dateCompleted, [exec.status]: true }"
+            :class="{ nowrunning: !exec.dateCompleted && exec.status !== 'waiting', nowwaiting: exec.status === 'waiting', [exec.status]: true }"
             @click="autoBulkEdit(exec)"
             @click.middle="middleClickRow(exec)"
           >
@@ -251,7 +251,8 @@
                 :disabled="
                   exec.status === 'running' ||
                   exec.status === 'scheduled' ||
-                  exec.status === 'queued'
+                  exec.status === 'queued' ||
+                  exec.status === 'waiting'
                 "
                 class="_defaultInput"
                 data-testid="bulk-delete-checkbox"
@@ -261,6 +262,11 @@
               <b
                 v-if="exec.status === 'running'"
                 class="fas fa-circle-notch fa-spin text-info"
+              ></b>
+              <b
+                v-else-if="exec.status === 'waiting'"
+                class="fas fa-pause-circle text-warning"
+                :title="waitingLabel(exec)"
               ></b>
               <b
                 v-else-if="exec.status === 'scheduled'"
@@ -325,6 +331,13 @@
                 type="default"
                 label
                 :label-text="$t('job.execution.queued')"
+              ></progress-bar>
+              <progress-bar
+                v-else-if="exec.status === 'waiting'"
+                :model-value="100"
+                type="warning"
+                label
+                :label-text="waitingLabel(exec)"
               ></progress-bar>
               <progress-bar
                 v-else-if="exec.job && exec.job.averageDuration"
@@ -968,6 +981,11 @@ export default defineComponent({
     executionStateCss(status: string) {
       return this.executionState(status).toUpperCase();
     },
+    waitingLabel(exec: any): string {
+      return exec && exec.suspendType === "operator-pause"
+        ? "Paused by operator"
+        : "Waiting for confirmation";
+    },
     reportStateCss(rpt: any) {
       return this.executionStateCss(this.reportState(rpt));
     },
@@ -1031,6 +1049,9 @@ export default defineComponent({
       }
       if (status == "running") {
         return "running";
+      }
+      if (status == "waiting") {
+        return "waiting";
       }
       if (status == "queued") {
         return "queued";

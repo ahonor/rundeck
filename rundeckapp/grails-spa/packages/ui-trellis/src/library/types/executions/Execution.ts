@@ -46,6 +46,11 @@ export interface Execution {
    */
   status: Status;
   customStatus?: string;
+  /**
+   * Discriminator for `waiting` executions — 'operator-pause' or 'confirmation'.
+   * Populated from the suspendMetadata JSON on the execution row.
+   */
+  suspendType?: string;
   project?: string;
   user?: string;
   serverUUID?: string;

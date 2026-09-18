@@ -1,0 +1,14 @@
+/* Minimal overrides only — inherit page styles for everything else */
+.confirm-panel-comment {
+    max-width: 500px;
+    margin-bottom: 10px;
+}
+.confirm-panel-buttons {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+.confirm-panel-status {
+    margin-top: 8px;
+    font-size: 13px;
+}

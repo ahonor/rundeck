@@ -84,7 +84,8 @@ public class StepOperation implements WorkflowSystem.Operation<WFSharedContext,O
 
 
         MutableStateObj stateChanges = States.mutable();
-        boolean success = null != result && result.isSuccess();
+        boolean suspended = null != result && result.isSuspended();
+        boolean success = !suspended && null != result && result.isSuccess();
         if (result != null) {
             EngineWorkflowExecutor.updateStateWithStepResultData(
                     stateChanges,
@@ -96,14 +97,30 @@ public class StepOperation implements WorkflowSystem.Operation<WFSharedContext,O
                 EngineWorkflowExecutor.stepKey(EngineWorkflowExecutor.STEP_COMPLETED_KEY, stepNum),
                 EngineWorkflowExecutor.VALUE_TRUE
         );
-        String stepResultValue = success
-                                 ? EngineWorkflowExecutor.STEP_STATE_RESULT_SUCCESS
-                                 : EngineWorkflowExecutor.STEP_STATE_RESULT_FAILURE;
+        String stepResultValue = suspended
+                                 ? EngineWorkflowExecutor.STEP_STATE_RESULT_SUSPENDED
+                                 : (success
+                                    ? EngineWorkflowExecutor.STEP_STATE_RESULT_SUCCESS
+                                    : EngineWorkflowExecutor.STEP_STATE_RESULT_FAILURE);
         stateChanges.updateState(
                 EngineWorkflowExecutor.stepKey(EngineWorkflowExecutor.STEP_STATE_KEY, stepNum),
                 stepResultValue
         );
-        if (success) {
+        if (suspended) {
+            // Suspend/resume: mark the per-step and any-step suspended flags.
+            // The STEP_ANY_STATE_SUSPENDED_KEY triggers the end-workflow rule,
+            // causing the processor loop to exit at the next iteration with
+            // this step's result in the accumulated operationResults.
+            // See spec §6.1 in docs/specs/workflow-suspend-resume.md.
+            stateChanges.updateState(
+                    EngineWorkflowExecutor.stepKey(EngineWorkflowExecutor.STEP_SUSPENDED_KEY, stepNum),
+                    EngineWorkflowExecutor.VALUE_TRUE
+            );
+            stateChanges.updateState(
+                    EngineWorkflowExecutor.STEP_ANY_STATE_SUSPENDED_KEY,
+                    EngineWorkflowExecutor.VALUE_TRUE
+            );
+        } else if (success) {
             stateChanges.updateState(
                     EngineWorkflowExecutor.STEP_ANY_STATE_SUCCESS_KEY,
                     EngineWorkflowExecutor.VALUE_TRUE

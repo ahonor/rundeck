@@ -107,15 +107,17 @@ public class WorkflowExecutionStateListenerAdapter implements WorkflowExecutionL
 
     public void finishWorkflowExecution(WorkflowExecutionResult result, StepExecutionContext executionContext,
             WorkflowExecutionItem item) {
+        ExecutionState wfState;
+        if (null != result && result.isSuspended()) {
+            wfState = ExecutionState.WAITING;
+        } else {
+            wfState = (null != result && result.isSuccess()) ? ExecutionState.SUCCEEDED : ExecutionState.FAILED;
+        }
         List<Pair<StepContextId, INodeEntry>> currentContext = stepContext.getCurrentContextPairs();
         if (null == currentContext || currentContext.size() < 1) {
-            notifyAllWorkflowState(
-                    null != result && result.isSuccess() ? ExecutionState.SUCCEEDED : ExecutionState.FAILED,
-                    new Date(), null);
+            notifyAllWorkflowState(wfState, new Date(), null);
         }else{
-            notifyAllSubWorkflowState(createIdentifier(),
-                    null != result && result.isSuccess() ? ExecutionState.SUCCEEDED : ExecutionState.FAILED,
-                    new Date(), null);
+            notifyAllSubWorkflowState(createIdentifier(), wfState, new Date(), null);
         }
         stepContext.finishContext();
     }
@@ -148,16 +150,22 @@ public class WorkflowExecutionStateListenerAdapter implements WorkflowExecutionL
     }
 
     private String resultMessage(StepExecutionResult result) {
+        if (null != result && result.isSuspended()) {
+            return "Waiting for confirmation";
+        }
         return null!=result?result.getFailureMessage():null;
     }
 
     private ExecutionState resultState(StepExecutionResult result) {
+        if (null != result && result.isSuspended()) {
+            return ExecutionState.WAITING;
+        }
         return (null!=result && result.isSuccess()) ? ExecutionState.SUCCEEDED :
                 ExecutionState.FAILED;
     }
 
     private Map<String, Object> resultMetadata(StepExecutionResult result) {
-        if (null != result && result.isSuccess()) {
+        if (null != result && (result.isSuccess() || result.isSuspended())) {
             return null;
         }
         HashMap<String, Object> map = new HashMap<>();
@@ -290,6 +298,47 @@ public class WorkflowExecutionStateListenerAdapter implements WorkflowExecutionL
         //if node step item is not state transitionable, ignore it
         notifyAllStepState(createIdentifier(), createStepStateChange(result), new Date());
         stepContext.finishNodeContext();
+    }
+
+    /**
+     * Replay a completed step's state transitions for resume scenarios.
+     * Unlike the normal listener path, this fires state transitions directly
+     * regardless of whether the step is a node-dispatch step or not.
+     * Used by {@code EngineWorkflowExecutor.executeWorkflowResume} to
+     * pre-populate the state model with steps that completed before suspend.
+     *
+     * @param step    1-based step number
+     * @param success whether the step succeeded
+     * @param node    the node name the step ran on (null for non-node steps)
+     */
+    public void replayCompletedStep(int step, boolean success, String node) {
+        Date now = new Date();
+        ExecutionState finalState = success ? ExecutionState.SUCCEEDED : ExecutionState.FAILED;
+
+        // Begin step context
+        stepContext.beginStepContext(StateUtils.stepContextId(step, false));
+        StepIdentifier id = createIdentifier();
+
+        // Step-level: RUNNING
+        notifyAllStepState(id, createStepStateChange(ExecutionState.RUNNING), now);
+
+        if (node != null) {
+            // Node-level: RUNNING then SUCCEEDED/FAILED
+            INodeEntry nodeEntry = new com.dtolabs.rundeck.core.common.NodeEntryImpl(node);
+            stepContext.beginNodeContext(nodeEntry);
+            StepIdentifier nodeId = createIdentifier();
+            notifyAllStepState(nodeId, createStepStateChange(ExecutionState.RUNNING), now);
+            notifyAllStepState(nodeId,
+                    StateUtils.stepStateChange(StateUtils.stepState(finalState), node), now);
+            stepContext.finishNodeContext();
+        } else {
+            // Non-node step: direct SUCCEEDED/FAILED
+            notifyAllStepState(id,
+                    StateUtils.stepStateChange(StateUtils.stepState(finalState), null), now);
+        }
+
+        // Finish step context
+        stepContext.finishStepContext();
     }
 
 }

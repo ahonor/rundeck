@@ -30,7 +30,13 @@ import com.dtolabs.rundeck.core.data.*;
 import com.dtolabs.rundeck.core.dispatcher.*;
 import com.dtolabs.rundeck.core.execution.component.ContextComponent;
 import com.dtolabs.rundeck.core.execution.workflow.*;
+import com.dtolabs.rundeck.core.execution.workflow.steps.StepExecutionResult;
 import com.dtolabs.rundeck.core.execution.workflow.steps.node.NodeExecutionContext;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.ResumePayload;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendedStepResult;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspensionNotAllowedException;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspensionPolicy;
 import com.dtolabs.rundeck.core.jobs.JobService;
 import com.dtolabs.rundeck.core.logging.LoggingManager;
 import com.dtolabs.rundeck.core.nodes.ProjectNodeService;
@@ -87,6 +93,34 @@ public class ExecutionContextImpl implements ExecutionContext, StepExecutionCont
     @Getter private WorkflowData workflowData;
     
     private ExecutionReference execution;
+    /**
+     * Wave 6: transient supplier that returns true if the operator has
+     * requested a pause via the API. Checked by StepCallable before each
+     * step invocation. Set by the Grails layer (ExecutionService) at
+     * execution start time; reads from the DB on each call.
+     */
+    private transient java.util.function.Supplier<Boolean> pauseCheckSupplier;
+    /**
+     * Wave 4 cycle/workflow-suspend-resume: resume payload delivered by the
+     * event that ended the suspension. Only non-null during a resume
+     * invocation of a previously suspended step. See spec §5.1.
+     */
+    private ResumePayload resumePayload;
+    /**
+     * Wave 4: frozen suspend metadata from the Execution.suspend_metadata
+     * DB column. Populated on resume; empty map on first invocation.
+     */
+    private Map<String, Object> suspendMetadata;
+    /**
+     * Set by {@link #suspend(SuspendRequest)} so that
+     * {@link com.dtolabs.rundeck.core.execution.workflow.steps.StepPluginAdapter}
+     * can detect a pending suspension after the void-returning
+     * {@code StepPlugin.executeStep()} returns. Without this field, the
+     * adapter has no way to distinguish "step completed successfully" from
+     * "step requested suspension" because both paths exit executeStep()
+     * without an exception.
+     */
+    private volatile SuspendedStepResult pendingSuspension;
 
     private ExecutionContextImpl() {
         stepContext = new ArrayList<>();
@@ -96,6 +130,7 @@ public class ExecutionContextImpl implements ExecutionContext, StepExecutionCont
         sharedDataContext = new WFSharedContext();
         outputContext = SharedDataContextUtils.outputContext(ContextView.global());
         componentList = new ArrayList<>();
+        suspendMetadata = Collections.emptyMap();
     }
 
     public static Builder builder() {
@@ -186,6 +221,67 @@ public class ExecutionContextImpl implements ExecutionContext, StepExecutionCont
     }
 
     @Override
+    public ResumePayload getResumePayload() {
+        return resumePayload;
+    }
+
+    @Override
+    public Map<String, Object> getSuspendMetadata() {
+        return suspendMetadata != null ? suspendMetadata : Collections.emptyMap();
+    }
+
+    /**
+     * Wave 2 suspend/resume (spec §5.1, §12 decision 9): the plugin-facing
+     * entry point for requesting a workflow suspension. Validates the
+     * checkpointability of this context's components via
+     * {@link SuspensionPolicy#validateComponents(List)} and, on success,
+     * returns a {@link SuspendedStepResult} that carries the request back to
+     * the engine's aggregation loop (see Wave 1:
+     * {@code EngineWorkflowExecutor.executeWorkflowImpl}).
+     *
+     * <p>Additional policy checks (parallel-strategy rejection, sub-workflow
+     * rejection, non-checkpointable log writer rejection) are layered on in
+     * subsequent waves as the required collaborators become available at
+     * suspend-call time.
+     */
+    @Override
+    public StepExecutionResult suspend(SuspendRequest request) throws SuspensionNotAllowedException {
+        if (request == null) {
+            throw new SuspensionNotAllowedException("SuspendRequest must not be null");
+        }
+        SuspensionPolicy.validateComponents(getComponentList());
+        SuspendedStepResult result = new SuspendedStepResult(request);
+        // Store the suspension so StepPluginAdapter can detect it after
+        // the void-returning StepPlugin.executeStep() completes.
+        this.pendingSuspension = result;
+        return result;
+    }
+
+    /**
+     * Returns the pending suspension set by {@link #suspend(SuspendRequest)},
+     * or {@code null} if no suspension was requested during this step's
+     * execution. Called by
+     * {@link com.dtolabs.rundeck.core.execution.workflow.steps.StepPluginAdapter}
+     * after {@code StepPlugin.executeStep()} returns to bridge the
+     * void-returning interface.
+     */
+    public SuspendedStepResult getPendingSuspension() {
+        return pendingSuspension;
+    }
+
+    /**
+     * Wave 6: check if operator has requested a pause. Returns false if
+     * no pause supplier is configured (normal execution path).
+     */
+    public boolean isPauseRequested() {
+        return pauseCheckSupplier != null && Boolean.TRUE.equals(pauseCheckSupplier.get());
+    }
+
+    public void setPauseCheckSupplier(java.util.function.Supplier<Boolean> supplier) {
+        this.pauseCheckSupplier = supplier;
+    }
+
+    @Override
     public String getCharsetEncoding() {
         return charsetEncoding;
     }
@@ -261,6 +357,18 @@ public class ExecutionContextImpl implements ExecutionContext, StepExecutionCont
                     ctx.componentList.addAll(original.getComponentList());
                 }
                 ctx.workflowData = original.getWorkflowData();
+                // Wave 4: copy resume payload + suspend metadata so per-step
+                // contexts inherit them from the base execution context.
+                if (original instanceof StepExecutionContext) {
+                    StepExecutionContext sec = (StepExecutionContext) original;
+                    ctx.resumePayload = sec.getResumePayload();
+                    ctx.suspendMetadata = sec.getSuspendMetadata();
+                }
+                // Wave 6: carry the pause-check supplier through to per-step
+                // contexts so StepCallable can check it.
+                if (original instanceof ExecutionContextImpl) {
+                    ctx.pauseCheckSupplier = ((ExecutionContextImpl) original).pauseCheckSupplier;
+                }
             }
         }
 
@@ -563,6 +671,27 @@ public class ExecutionContextImpl implements ExecutionContext, StepExecutionCont
 
         public Builder framework(IFramework framework) {
             ctx.framework = framework;
+            return this;
+        }
+
+        /**
+         * Wave 4 cycle/workflow-suspend-resume: set the resume payload that
+         * the suspended step plugin will read via
+         * {@link StepExecutionContext#getResumePayload()}.
+         */
+        public Builder resumePayload(ResumePayload resumePayload) {
+            ctx.resumePayload = resumePayload;
+            return this;
+        }
+
+        /**
+         * Wave 4: set the frozen suspend metadata that the step plugin reads
+         * via {@link StepExecutionContext#getSuspendMetadata()}.
+         */
+        public Builder suspendMetadata(Map<String, Object> suspendMetadata) {
+            ctx.suspendMetadata = suspendMetadata != null
+                    ? Collections.unmodifiableMap(new HashMap<>(suspendMetadata))
+                    : Collections.emptyMap();
             return this;
         }
 

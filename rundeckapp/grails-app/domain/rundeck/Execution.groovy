@@ -68,11 +68,27 @@ class Execution extends ExecutionContext implements EmbeddedJsonData, ExecutionD
     Long retryOriginalId
     Long retryPrevId
     String extraMetadata
+    // -------------------------------------------------------------------
+    // Wave 2 cycle/workflow-suspend-resume: suspend/resume state columns.
+    // See docs/specs/workflow-suspend-resume.md §2.3 and the Liquibase
+    // migration at rundeckapp/grails-app/migrations/core/SuspendResume-6.0.groovy.
+    // These fields are populated only while an execution is in the
+    // 'waiting' state and cleared on terminal transition per invariant I11.
+    // -------------------------------------------------------------------
+    String  checkpointData
+    String  suspendMetadata
+    Date    waitStartedAt
+    Date    waitTimeoutAt
+    Date    lastResumedAt
+    Boolean resumeReady = false
+    String  resumePayload
+    Integer resumeAttemptCount = 0
+    Boolean pauseRequested = false
     private static final String REMOTE_LOG_FILEPATH_PREFIX = 'ext:'
 
     boolean serverNodeUUIDChanged = false
 
-    static transients = ['executionState', 'customStatusString', 'userRoles', 'extraMetadataMap', 'serverNodeUUIDChanged', 'execIdForLogStore', 'workflowJsonMap', 'workflowData']
+    static transients = ['executionState', 'customStatusString', 'userRoles', 'extraMetadataMap', 'serverNodeUUIDChanged', 'execIdForLogStore', 'workflowJsonMap', 'workflowData', 'suspendType']
 
     static constraints = {
         importFrom SharedExecutionConstraints
@@ -93,6 +109,13 @@ class Execution extends ExecutionContext implements EmbeddedJsonData, ExecutionD
         extraMetadata(nullable: true)
         uuid(nullable: true)
         jobUuid(nullable: true)
+        // Wave 2 cycle/workflow-suspend-resume: suspend/resume columns
+        checkpointData(nullable: true)
+        suspendMetadata(nullable: true)
+        waitStartedAt(nullable: true)
+        waitTimeoutAt(nullable: true)
+        lastResumedAt(nullable: true)
+        resumePayload(nullable: true)
     }
 
     static mapping = {
@@ -125,6 +148,10 @@ class Execution extends ExecutionContext implements EmbeddedJsonData, ExecutionD
         serverNodeUUID(type: 'string')
         extraMetadata(type: 'text')
         workflowJson(type: 'text')
+        // Wave 2 cycle/workflow-suspend-resume
+        checkpointData(type: 'text')
+        suspendMetadata(type: 'text')
+        resumePayload(type: 'text')
 
         DomainIndexHelper.generate(delegate) {
             index 'EXEC_IDX_1', ['id', 'project', 'dateCompleted']
@@ -168,6 +195,11 @@ class Execution extends ExecutionContext implements EmbeddedJsonData, ExecutionD
     static DetachedCriteria<Execution> runningExecutionsCriteria = new DetachedCriteria<>(Execution).build {
         isNotNull('dateStarted')
         isNull('dateCompleted')
+        // Wave 2 cycle/workflow-suspend-resume: waiting executions are
+        // non-terminal but are NOT orphan "running" rows. Excluding them
+        // here prevents the reaper and similar running-job scans from
+        // touching them. See spec §4 invariant I1 and §8.3.
+        ne('status', ExecutionService.EXECUTION_WAITING)
         or {
             isNull('status')
             and{
@@ -293,6 +325,13 @@ class Execution extends ExecutionContext implements EmbeddedJsonData, ExecutionD
     public String getExecutionState() {
         return cancelled ? ExecutionService.EXECUTION_ABORTED :
             (null == dateCompleted && status == ExecutionService.EXECUTION_QUEUED) ? ExecutionService.EXECUTION_QUEUED :
+                // Wave 2 cycle/workflow-suspend-resume: a waiting execution
+                // has no dateCompleted but is NOT "running" — the thread
+                // has returned and the execution is parked at a step
+                // boundary awaiting an external event. Must be checked
+                // BEFORE the generic (dateCompleted == null → RUNNING)
+                // branch below.
+                (null == dateCompleted && status == ExecutionService.EXECUTION_WAITING) ? ExecutionService.EXECUTION_WAITING :
                 null != dateStarted && dateStarted.getTime() > System.currentTimeMillis() ? ExecutionService.EXECUTION_SCHEDULED :
                     (null == dateCompleted) ? ExecutionService.EXECUTION_RUNNING :
                             (status in ['true', 'succeeded']) ? ExecutionService.EXECUTION_SUCCEEDED :
@@ -313,6 +352,21 @@ class Execution extends ExecutionContext implements EmbeddedJsonData, ExecutionD
         executionState==ExecutionService.EXECUTION_STATE_OTHER?status:null
     }
 
+    /**
+     * Parse the suspendMetadata JSON and return the 'type' discriminator
+     * (e.g. 'operator-pause' or 'confirmation'). Null when the execution
+     * is not waiting or the metadata is missing/invalid.
+     */
+    public String getSuspendType(){
+        if(!suspendMetadata) return null
+        try {
+            def parsed = new com.fasterxml.jackson.databind.ObjectMapper().readValue(suspendMetadata, Map)
+            return parsed?.get('type')
+        } catch (Exception ignored) {
+            return null
+        }
+    }
+
     public static boolean isCustomStatusString(String value){
         null!=value && !(value.toLowerCase() in [ExecutionService.EXECUTION_TIMEDOUT,
                                                  ExecutionService.EXECUTION_FAILED_WITH_RETRY,
@@ -320,7 +374,9 @@ class Execution extends ExecutionContext implements EmbeddedJsonData, ExecutionD
                                                  ExecutionService.EXECUTION_SUCCEEDED,
                                                  ExecutionService.EXECUTION_FAILED,
                                                  ExecutionService.EXECUTION_QUEUED,
-                                                 ExecutionService.EXECUTION_SCHEDULED])
+                                                 ExecutionService.EXECUTION_SCHEDULED,
+                                                 // Wave 2 cycle/workflow-suspend-resume
+                                                 ExecutionService.EXECUTION_WAITING])
     }
 
     // various utility methods helpful to the presentation layer

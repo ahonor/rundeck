@@ -29,6 +29,18 @@ public class AuthConstants {
     public static final String ACTION_DELETE = "delete";
     public static final String ACTION_RUN = "run";
     public static final String ACTION_KILL = "kill";
+    /**
+     * Wave 5 cycle/workflow-suspend-resume: authorization action for
+     * confirming a waiting execution (approve/deny). See
+     * docs/specs/confirm-workflow-step.md §9.
+     */
+    public static final String ACTION_CONFIRM = "confirm";
+    /**
+     * Wave 6 cycle/workflow-suspend-resume: authorization action for
+     * pausing/resuming a running execution at step boundaries. See
+     * docs/specs/operator-pause.md §7.
+     */
+    public static final String ACTION_PAUSE = "pause";
     public static final String ACTION_ADMIN = "admin";
     public static final String ACTION_OPS_ADMIN = "ops_admin";
     public static final String ACTION_APP_ADMIN = "app_admin";

@@ -169,6 +169,13 @@ class ExecutionJob implements InterruptableJob {
             if (!metricEmitted) {
                 meterStartExecutionFailure(context)
             }
+        }else if (result.suspended) {
+            // Wave 2 cycle/workflow-suspend-resume: suspended executions
+            // are non-terminal. onWorkflowSuspended already persisted the
+            // waiting state in executeCommand; do NOT call saveState (which
+            // would write dateCompleted and fire completion notifications)
+            // and do NOT record the execution as successful/interrupted/
+            // failed in the metric registry.
         }else if (success) {
             meterExecutionSuccess(context)
         } else if (wasInterrupted) {
@@ -176,19 +183,25 @@ class ExecutionJob implements InterruptableJob {
         } else {
             meterExecutionFailure(context)
         }
-        saveState(
-                context.jobDetail.jobDataMap,
-                initMap.executionService,
-                initMap.execution ? initMap.execution : (Execution) null,
-                success,
-                wasInterrupted,
-                wasTimeout,
-                initMap.temp,
-                statusString,
-                initMap.scheduledExecutionId,
-                initMap,
-                result?.execmap
-        )
+        if (result?.suspended) {
+            // Skip saveState entirely for suspended executions. See spec §6.1
+            // and invariant I4 in docs/specs/workflow-suspend-resume.md.
+            log.debug("ExecutionJob: skipping saveState for suspended execution ${initMap.execution?.id}")
+        } else {
+            saveState(
+                    context.jobDetail.jobDataMap,
+                    initMap.executionService,
+                    initMap.execution ? initMap.execution : (Execution) null,
+                    success,
+                    wasInterrupted,
+                    wasTimeout,
+                    initMap.temp,
+                    statusString,
+                    initMap.scheduledExecutionId,
+                    initMap,
+                    result?.execmap
+            )
+        }
         initMap.jobSchedulerService.afterExecution(initMap.execution.asReference(), context.mergedJobDataMap, initMap.authContext)
     }
 
@@ -405,6 +418,12 @@ class ExecutionJob implements InterruptableJob {
         boolean success
         ExecutionService.AsyncStarted execmap
         WorkflowExecutionResult result
+        // Wave 2 cycle/workflow-suspend-resume: when true, the execution
+        // parked at a step boundary via context.suspend(...) and the
+        // caller (execute_internal) must skip saveState and all terminal
+        // notifications. The onWorkflowSuspended call in executeCommand
+        // has already persisted the waiting state.
+        boolean suspended
     }
     @CompileStatic
     RunResult executeCommand(RunContext runContext, JobExecutionContext jobExecutionContext) {
@@ -514,6 +533,33 @@ class ExecutionJob implements InterruptableJob {
             }
         }
 
+
+        // Wave 2 cycle/workflow-suspend-resume: detect a suspended workflow
+        // outcome after the thread returns. Suspended executions go through
+        // a separate path: tear down thread-bound I/O, close the log writer
+        // via suspend() (no footer), persist waiting state to the DB.
+        // Crucially the normal finishExecution path is SKIPPED because it
+        // writes completion log messages and closes the log normally.
+        if (thread.isSuspended()) {
+            Retried suspendRetried = withRetry(
+                    finalizeRetryMax,
+                    finalizeRetryDelay,
+                    "Execution ${runContext.execution.id} onWorkflowSuspended:",
+                    runContext.executionService.&isApplicationShutdown
+            ) {
+                runContext.executionUtilService.suspendExecution(execmap)
+                runContext.executionService.onWorkflowSuspended(execmap, thread.result)
+                true
+            }
+            if (!suspendRetried.complete && suspendRetried.caught) {
+                throw new RuntimeException(
+                        "Execution ${runContext.execution.id} failed to suspend: " + suspendRetried.caught.message,
+                        suspendRetried.caught
+                )
+            }
+            log.debug("ExecutionJob: execution ${runContext.execution.id} suspended")
+            return new RunResult(success: false, suspended: true, execmap: execmap, result: thread.result)
+        }
 
         Retried retried = withRetry(
             finalizeRetryMax,

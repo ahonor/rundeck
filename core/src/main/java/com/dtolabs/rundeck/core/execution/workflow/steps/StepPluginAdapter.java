@@ -28,8 +28,14 @@ import com.dtolabs.rundeck.core.data.SharedDataContextUtils;
 import com.dtolabs.rundeck.core.data.UnexpandableBehavior;
 import com.dtolabs.rundeck.core.dispatcher.ContextView;
 import com.dtolabs.rundeck.core.execution.ConfiguredStepExecutionItem;
+import com.dtolabs.rundeck.core.execution.ExecutionContextImpl;
 import com.dtolabs.rundeck.core.execution.StepExecutionItem;
 import com.dtolabs.rundeck.core.execution.workflow.StepExecutionContext;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.ResumePayload;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspensionNotAllowedException;
+import com.dtolabs.rundeck.plugins.interaction.HILRequest;
+import com.dtolabs.rundeck.plugins.interaction.HILResponse;
+import com.dtolabs.rundeck.plugins.interaction.InteractionPlugin;
 import com.dtolabs.rundeck.core.plugins.configuration.*;
 import com.dtolabs.rundeck.core.utils.Converter;
 import com.dtolabs.rundeck.plugins.ServiceNameConstants;
@@ -41,6 +47,7 @@ import org.rundeck.app.spi.Services;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 
@@ -118,7 +125,11 @@ public class StepPluginAdapter implements StepExecutor, Describable, DynamicProp
         Map<String, Object>  config = PluginAdapterUtility.configureProperties(resolver, getDescription(),plugin, PropertyScope.InstanceOnly);
 
         try {
-            plugin.executeStep(stepContext, config);
+            if (plugin instanceof InteractionPlugin) {
+                dispatchInteraction((InteractionPlugin) plugin, stepContext, executionContext, config);
+            } else {
+                plugin.executeStep(stepContext, config);
+            }
         } catch (StepException e) {
             executionContext.getExecutionListener().log(
                     Constants.ERR_LEVEL,
@@ -141,7 +152,102 @@ public class StepPluginAdapter implements StepExecutor, Describable, DynamicProp
                             + stringWriter.toString());
             return new StepExecutionResultImpl(e, StepFailureReason.PluginFailed, e.getMessage());
         }
+        // Suspend/resume: check if the plugin called context.suspend()
+        // during its executeStep(). StepPlugin.executeStep is void-returning,
+        // so a suspension signal can only be communicated via a side-channel
+        // on the execution context. ExecutionContextImpl.suspend() stores a
+        // SuspendedStepResult in pendingSuspension; if present, return it
+        // instead of the default success result. See spec §5.1 and the
+        // StepPluginAdapter void-return gap documented in Wave 5.
+        if (executionContext instanceof ExecutionContextImpl) {
+            com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendedStepResult pending =
+                    ((ExecutionContextImpl) executionContext).getPendingSuspension();
+            if (pending != null) {
+                return pending;
+            }
+        }
         return new StepExecutionResultImpl();
+    }
+
+    /**
+     * Dispatch a step backed by an {@link InteractionPlugin}. On first invocation
+     * the plugin builds a typed request and the engine suspends on the envelope it
+     * produces. On the resume invocation the typed request is recovered from the
+     * frozen suspend metadata, the response is validated against it, and the
+     * plugin is handed the typed response.
+     *
+     * <p>Interaction plugins register under the {@code WorkflowStep} service and
+     * also implement {@link StepPlugin}, so the job definition format is unchanged;
+     * this method simply prefers the typed contract when the plugin offers it.
+     */
+    private void dispatchInteraction(
+            final InteractionPlugin interaction,
+            final PluginStepContext stepContext,
+            final StepExecutionContext executionContext,
+            final Map<String, Object> config
+    ) throws StepException
+    {
+        ResumePayload resumePayload = executionContext.getResumePayload();
+
+        if (resumePayload == null) {
+            HILRequest request = interaction.prepareRequest(stepContext, config);
+            if (null == request) {
+                throw new StepException(
+                        "InteractionPlugin returned null from prepareRequest()",
+                        StepFailureReason.PluginFailed
+                );
+            }
+            String declared = interaction.supportedPrimitive();
+            if (null == declared || declared.isEmpty()) {
+                throw new StepException(
+                        "InteractionPlugin must declare a non-empty supported primitive",
+                        StepFailureReason.PluginFailed
+                );
+            }
+            if (!declared.equals(request.getPrimitive())) {
+                throw new StepException(
+                        "InteractionPlugin returned a request for primitive '"
+                        + request.getPrimitive() + "' but declares support for '" + declared + "'",
+                        StepFailureReason.PluginFailed
+                );
+            }
+            try {
+                executionContext.suspend(request.toSuspendRequest());
+            } catch (SuspensionNotAllowedException e) {
+                throw new StepException(e.getMessage(), e, StepFailureReason.PluginFailed);
+            }
+            return;
+        }
+
+        if (!(resumePayload instanceof HILResponse)) {
+            throw new StepException(
+                    "Expected a HIL response for primitive '" + interaction.supportedPrimitive()
+                    + "' but received resume payload of type '" + resumePayload.getType() + "'",
+                    StepFailureReason.PluginFailed
+            );
+        }
+        HILResponse response = (HILResponse) resumePayload;
+
+        HILRequest request = HILRequest.fromSuspendMetadata(executionContext.getSuspendMetadata());
+        if (null != request) {
+            if (!request.getPrimitive().equals(response.getPrimitive())) {
+                throw new StepException(
+                        "HIL response primitive '" + response.getPrimitive()
+                        + "' does not match suspended request primitive '" + request.getPrimitive() + "'",
+                        StepFailureReason.PluginFailed
+                );
+            }
+            List<String> errors = request.validateResponse(response);
+            if (null != errors && !errors.isEmpty()) {
+                throw new StepException(
+                        "Invalid response for primitive '" + request.getPrimitive() + "': "
+                        + String.join("; ", errors),
+                        StepFailureReason.PluginFailed
+                );
+            }
+        }
+
+        interaction.onResponse(stepContext, response);
     }
 
 

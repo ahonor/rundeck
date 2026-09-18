@@ -21,6 +21,7 @@ import com.dtolabs.rundeck.core.NodesetEmptyException;
 import com.dtolabs.rundeck.core.common.IFramework;
 import com.dtolabs.rundeck.core.common.NodesSelector;
 import com.dtolabs.rundeck.core.dispatcher.*;
+import com.dtolabs.rundeck.core.execution.ExecutionContextImpl;
 import com.dtolabs.rundeck.core.execution.ExecutionListener;
 import com.dtolabs.rundeck.core.execution.StepExecutionItem;
 import com.dtolabs.rundeck.core.execution.service.ExecutionServiceException;
@@ -31,6 +32,10 @@ import com.dtolabs.rundeck.core.execution.workflow.steps.StepException;
 import com.dtolabs.rundeck.core.execution.workflow.steps.StepExecutionResult;
 import com.dtolabs.rundeck.core.execution.workflow.steps.StepExecutionResultImpl;
 import com.dtolabs.rundeck.core.execution.workflow.steps.StepFailureReason;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.ExecutionCheckpoint;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.ResumePayload;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest;
+import com.dtolabs.rundeck.core.execution.workflow.state.WorkflowExecutionStateListenerAdapter;
 import com.dtolabs.rundeck.core.rules.*;
 import com.dtolabs.rundeck.plugins.ServiceNameConstants;
 import com.google.common.base.Throwables;
@@ -62,6 +67,13 @@ public class EngineWorkflowExecutor extends BaseWorkflowExecutor {
     public static final String STEP_ANY_STATE_SKIPPED_KEY = "step.any.state.skipped";
     public static final String STEP_ANY_STATE_SUCCESS_KEY = "step.any.state.success";
     public static final String STEP_ANY_STATE_FAILED_KEY = "step.any.state.failed";
+    /** Suspend/resume: set to {@code "true"} on any step whose result has
+     *  {@code isSuspended() == true}. Triggers the suspended-end-workflow
+     *  rule, causing the engine processor loop to exit with the suspended
+     *  step's result in accumulated results. See spec §6.1. */
+    public static final String STEP_ANY_STATE_SUSPENDED_KEY = "step.any.state.suspended";
+    /** Per-step suspended marker: {@code step.<n>.suspended = "true"}. */
+    public static final String STEP_SUSPENDED_KEY = "step.#.suspended";
     public static final String STEP_COMPLETED_KEY = "step.#.completed";
     public static final String VALUE_TRUE = Boolean.TRUE.toString();
     private static final Rule FLOW_CONTROL_HALT_END_WORKFLOW = Rules.conditionsRule(
@@ -85,17 +97,33 @@ public class EngineWorkflowExecutor extends BaseWorkflowExecutor {
             ),
             Workflows.getWorkflowEndState()
     );
+    /**
+     * Suspend/resume: when any step's result is suspended, end the workflow
+     * at the next processor loop iteration. Keeps the suspended step's
+     * result in the accumulated {@code operationResults}; the aggregation
+     * loop in {@code executeWorkflowImpl} then builds a suspended
+     * {@link WorkflowExecutionResult}. See spec §6.1.
+     */
+    private static final Rule STEP_SUSPENDED_END_WORKFLOW = Rules.conditionsRule(
+            Rules.equalsCondition(
+                    STEP_ANY_STATE_SUSPENDED_KEY,
+                    VALUE_TRUE
+            ),
+            Workflows.getWorkflowEndState()
+    );
     private static final Set<Rule> INITIAL_RULES = Collections.unmodifiableSet(
             new HashSet<>(
                     Arrays.asList(
                             FLOW_CONTROL_HALT_END_WORKFLOW,
-                            STEP_FAILURE_KEEPGOING_FALSE_END_WORKFLOW
+                            STEP_FAILURE_KEEPGOING_FALSE_END_WORKFLOW,
+                            STEP_SUSPENDED_END_WORKFLOW
                     )
             )
     );
     public static final String STEP_STATE_RESULT_SUCCESS = "success";
     public static final String STEP_STATE_RESULT_FAILURE = "failure";
     public static final String STEP_STATE_RESULT_SKIPPED = "skipped";
+    public static final String STEP_STATE_RESULT_SUSPENDED = "suspended";
     public static final String STEP_CONTROL_KEY = "step.#.start";
     public static final String STEP_CONTROL_SKIP_KEY = "step.#.skip";
     public static final String STEP_CONTROL_START = "start";
@@ -202,6 +230,9 @@ public class EngineWorkflowExecutor extends BaseWorkflowExecutor {
         final IWorkflow workflow = item.getWorkflow();
         final Map<Integer, StepExecutionResult> stepFailures = new HashMap<>();
         final List<StepExecutionResult> stepResults = new ArrayList<>();
+        // Suspend/resume: collected when one or more steps return a suspended
+        // result. Populated in the result aggregation loop below.
+        final List<SuspendRequest> suspendRequests = new ArrayList<>();
 
 
         WorkflowStrategy strategyForWorkflow;
@@ -277,11 +308,24 @@ public class EngineWorkflowExecutor extends BaseWorkflowExecutor {
 
                 if (completed != null) {
                     StepResultCapture result = completed.getStepResultCapture();
-                    if (!result.getStepResult().isSuccess()) {
-                        stepFailures.put(completed.getStepNum(), result.getStepResult());
+                    StepExecutionResult stepResult = result.getStepResult();
+                    // Suspend/resume: check isSuspended() BEFORE isSuccess().
+                    // A suspended step is neither a success nor a failure;
+                    // it is a third state. Do NOT add it to stepFailures.
+                    // See spec §6.1 and invariant I4.
+                    if (stepResult != null && stepResult.isSuspended()) {
+                        if (stepResult.getSuspendRequest() != null) {
+                            suspendRequests.add(stepResult.getSuspendRequest());
+                        }
+                        stepResults.add(stepResult);
                         workflowSuccess = false;
+                    } else {
+                        if (!stepResult.isSuccess()) {
+                            stepFailures.put(completed.getStepNum(), stepResult);
+                            workflowSuccess = false;
+                        }
+                        stepResults.add(stepResult);
                     }
-                    stepResults.add(result.getStepResult());
                     if (result.getControlBehavior() != null && result.getControlBehavior() != ControlBehavior.Continue) {
                         controlBehavior = result.getControlBehavior();
                         statusString = result.getStatusString();
@@ -327,6 +371,22 @@ public class EngineWorkflowExecutor extends BaseWorkflowExecutor {
         final Exception fexception = exception;
 
         final Map<String, Collection<StepExecutionResult>> nodeFailures = convertFailures(stepFailures);
+        // Suspend/resume: when any step suspended, return a suspended
+        // WorkflowExecutionResult carrying the collected SuspendRequests.
+        // The workflow is neither successful nor failed; it is parked at a
+        // step boundary. See spec §6.1 in docs/specs/workflow-suspend-resume.md.
+        if (!suspendRequests.isEmpty()) {
+            return new BaseWorkflowExecutionResult(
+                    stepResults,
+                    nodeFailures,
+                    stepFailures,
+                    fexception,
+                    workflowResult,
+                    sharedContext,
+                    true,
+                    suspendRequests
+            );
+        }
         return new BaseWorkflowExecutionResult(
                 stepResults,
                 nodeFailures,
@@ -598,6 +658,249 @@ public class EngineWorkflowExecutor extends BaseWorkflowExecutor {
                 stepKey(STEP_CONTROL_SKIP_KEY, stepNum),
                 VALUE_TRUE
         );
+    }
+
+    /**
+     * Wave 4 cycle/workflow-suspend-resume: resume a workflow from a
+     * checkpoint. Re-invokes the suspended step with the resume payload
+     * (Phase A), then executes remaining steps via the normal engine path
+     * (Phase B). This two-phase approach avoids resume-payload leaking to
+     * non-suspended steps.
+     *
+     * <p>See spec §6.2 in {@code docs/specs/workflow-suspend-resume.md}
+     * and cycle manifest Wave 4.
+     *
+     * @param executionContext  rehydrated execution context (from
+     *                          {@code buildExecutionContextFromCheckpoint})
+     * @param item              the original workflow execution item
+     * @param checkpoint        the persisted checkpoint from the DB
+     * @param resumePayload     the payload delivered by the resume event
+     * @param suspendMetadata   frozen metadata from the DB column
+     *
+     * @return the workflow result — success, failure, or re-suspended
+     */
+    public WorkflowExecutionResult executeWorkflowResume(
+            final StepExecutionContext executionContext,
+            final WorkflowExecutionItem item,
+            final ExecutionCheckpoint checkpoint,
+            final ResumePayload resumePayload,
+            final Map<String, Object> suspendMetadata
+    ) {
+        return executeWorkflowResume(executionContext, item, checkpoint, resumePayload, suspendMetadata, null, null);
+    }
+
+    /**
+     * Resume a suspended workflow execution.
+     *
+     * @param stateAdapter optional state listener adapter for replaying completed step states
+     * @param localNodeName optional node name for node-level state replay
+     */
+    public WorkflowExecutionResult executeWorkflowResume(
+            final StepExecutionContext executionContext,
+            final WorkflowExecutionItem item,
+            final ExecutionCheckpoint checkpoint,
+            final ResumePayload resumePayload,
+            final Map<String, Object> suspendMetadata,
+            final WorkflowExecutionStateListenerAdapter stateAdapter,
+            final String localNodeName
+    ) {
+        final IWorkflow workflow = item.getWorkflow();
+        final int suspIdx = checkpoint.getSuspendedStepIndex();
+        final int baseStepNum = executionContext.getStepNumber();
+
+        final List<StepExecutionResult> allStepResults = new ArrayList<>();
+        final Map<Integer, StepExecutionResult> allStepFailures = new HashMap<>();
+
+        // ---------------------------------------------------------------
+        // Notify state listeners: begin workflow + replay completed steps.
+        // This initializes the MutableWorkflowState and fires synthetic
+        // step events for steps that completed before the suspend, so
+        // the UI shows them as SUCCEEDED rather than WAITING.
+        // ---------------------------------------------------------------
+        final WorkflowExecutionListener wlistener = getWorkflowListener(executionContext);
+        if (null != wlistener) {
+            wlistener.beginWorkflowExecution(executionContext, item);
+        }
+
+        // Replay completed steps via the state adapter directly.
+        // This bypasses the normal listener chain which skips state
+        // notifications for node-dispatch steps in finishWorkflowItem.
+        if (stateAdapter != null && checkpoint.getCompletedStepResults() != null) {
+            for (ExecutionCheckpoint.CompletedStepResult completed : checkpoint.getCompletedStepResults()) {
+                final int stepNum = baseStepNum + completed.getStepIndex();
+                stateAdapter.replayCompletedStep(stepNum, completed.isSuccess(), localNodeName);
+            }
+        }
+
+        WorkflowExecutionResult result = null;
+        try {
+        // ---------------------------------------------------------------
+        // Phase A: re-invoke the suspended step with the resume payload.
+        // Direct invocation via executeWFItem, not through the rule engine.
+        // Fire listener events so step state transitions properly.
+        // ---------------------------------------------------------------
+        final StepExecutionItem suspCmd = workflow.getCommands().get(suspIdx);
+        final int suspStepNum = baseStepNum + suspIdx;
+
+        // Invariant P7 (operator-pause): the paused step never ran, so it
+        // must execute as a fresh first invocation. Clearing resumePayload
+        // also prevents a confirm step at the pause boundary from
+        // misinterpreting an OperatorResumePayload as a ConfirmResponse.
+        final boolean operatorPause = suspendMetadata != null
+                && "operator-pause".equals(suspendMetadata.get("type"));
+        final ResumePayload effectiveResumePayload = operatorPause ? null : resumePayload;
+
+        final StepExecutionContext resumeCtx =
+                ExecutionContextImpl.builder(executionContext)
+                        .stepNumber(suspStepNum)
+                        .resumePayload(effectiveResumePayload)
+                        .suspendMetadata(suspendMetadata)
+                        .build();
+
+        if (null != wlistener) {
+            wlistener.beginWorkflowItem(suspStepNum, suspCmd);
+        }
+
+        final StepExecutionResult suspResult = executeWFItem(
+                resumeCtx,
+                allStepFailures,
+                suspStepNum,
+                suspCmd
+        );
+        allStepResults.add(suspResult);
+
+        // Merge step output data into the parent shared context so
+        // subsequent steps can reference variables set by the confirm
+        // plugin (e.g., ${data.confirm.comment}). WFSharedContext.with()
+        // creates a wrapper whose writes go to its own map, not the
+        // base, so we must explicitly merge back.
+        executionContext.getSharedDataContext().merge(resumeCtx.getSharedDataContext());
+        if (resumeCtx.getOutputContext() instanceof DataOutput) {
+            WFSharedContext stepOutput = ((DataOutput) resumeCtx.getOutputContext()).getSharedContext();
+            executionContext.getSharedDataContext().merge(stepOutput);
+        }
+
+        if (null != wlistener) {
+            wlistener.finishWorkflowItem(suspStepNum, suspCmd, suspResult);
+        }
+
+        // If the step re-suspends, return a suspended workflow result.
+        if (suspResult.isSuspended()) {
+            List<SuspendRequest> suspendRequests = new ArrayList<>();
+            if (suspResult.getSuspendRequest() != null) {
+                suspendRequests.add(suspResult.getSuspendRequest());
+            }
+            result = new BaseWorkflowExecutionResult(
+                    allStepResults,
+                    convertFailures(allStepFailures),
+                    allStepFailures,
+                    null,
+                    workflowResult(false, null, ControlBehavior.Continue, WFSharedContext.withBase(executionContext.getSharedDataContext())),
+                    WFSharedContext.withBase(executionContext.getSharedDataContext()),
+                    true,
+                    suspendRequests
+            );
+            return result;
+        }
+
+        // If the step failed and keepgoing is false, stop.
+        if (!suspResult.isSuccess() && !workflow.isKeepgoing()) {
+            result = new BaseWorkflowExecutionResult(
+                    allStepResults,
+                    convertFailures(allStepFailures),
+                    allStepFailures,
+                    null,
+                    workflowResult(false, null, ControlBehavior.Continue, WFSharedContext.withBase(executionContext.getSharedDataContext())),
+                    WFSharedContext.withBase(executionContext.getSharedDataContext())
+            );
+            return result;
+        }
+
+        // ---------------------------------------------------------------
+        // Phase B: execute remaining steps (suspIdx+1 .. end) directly
+        // via executeWFItem with listener events. We avoid
+        // executeWorkflowImpl here because the rule engine generates
+        // start conditions referencing original step numbers (e.g.,
+        // after.step.2) which don't exist in a sub-workflow context.
+        // ---------------------------------------------------------------
+        boolean overallSuccess = suspResult.isSuccess();
+        for (int i = suspIdx + 1; i < workflow.getCommands().size(); i++) {
+            final StepExecutionItem cmd = workflow.getCommands().get(i);
+            final int stepNum = baseStepNum + i;
+            final StepExecutionContext stepCtx =
+                    ExecutionContextImpl.builder(executionContext)
+                            .stepNumber(stepNum)
+                            .build();
+
+            if (null != wlistener) {
+                wlistener.beginWorkflowItem(stepNum, cmd);
+            }
+
+            final StepExecutionResult stepResult = executeWFItem(
+                    stepCtx, allStepFailures, stepNum, cmd);
+            allStepResults.add(stepResult);
+
+            // Merge step output into shared context for subsequent steps
+            executionContext.getSharedDataContext().merge(stepCtx.getSharedDataContext());
+            if (stepCtx.getOutputContext() instanceof DataOutput) {
+                WFSharedContext stepOutput = ((DataOutput) stepCtx.getOutputContext()).getSharedContext();
+                executionContext.getSharedDataContext().merge(stepOutput);
+            }
+
+            if (null != wlistener) {
+                wlistener.finishWorkflowItem(stepNum, cmd, stepResult);
+            }
+
+            // Handle re-suspension
+            if (stepResult.isSuspended()) {
+                List<SuspendRequest> newSuspendRequests = new ArrayList<>();
+                if (stepResult.getSuspendRequest() != null) {
+                    newSuspendRequests.add(stepResult.getSuspendRequest());
+                }
+                result = new BaseWorkflowExecutionResult(
+                        allStepResults,
+                        convertFailures(allStepFailures),
+                        allStepFailures,
+                        null,
+                        workflowResult(false, null, ControlBehavior.Continue,
+                                WFSharedContext.withBase(executionContext.getSharedDataContext())),
+                        WFSharedContext.withBase(executionContext.getSharedDataContext()),
+                        true,
+                        newSuspendRequests
+                );
+                return result;
+            }
+
+            // Handle failure with keepgoing=false
+            if (!stepResult.isSuccess()) {
+                overallSuccess = false;
+                if (!workflow.isKeepgoing()) {
+                    break;
+                }
+            }
+        }
+
+        result = new BaseWorkflowExecutionResult(
+                allStepResults,
+                convertFailures(allStepFailures),
+                allStepFailures,
+                null,
+                workflowResult(overallSuccess, null, ControlBehavior.Continue,
+                        WFSharedContext.withBase(executionContext.getSharedDataContext())),
+                WFSharedContext.withBase(executionContext.getSharedDataContext())
+        );
+        return result;
+
+        } finally {
+            // Fire finishWorkflowExecution so the state model transitions
+            // to a terminal state (SUCCEEDED/FAILED). Suppress for
+            // re-suspended results (same as BaseWorkflowExecutor).
+            if (null != wlistener) {
+                if (result == null || !result.isSuspended()) {
+                    wlistener.finishWorkflowExecution(result, executionContext, item);
+                }
+            }
+        }
     }
 
     public static class DefaultAugmentor

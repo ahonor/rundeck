@@ -93,6 +93,10 @@ public class WorkflowExecutionServiceThread
             }
             final WorkflowExecutor executorForItem = weservice.getExecutorForItem(weitem);
             setResult(executorForItem.executeWorkflow(executionContext, weitem));
+            // Wave 2 suspend/resume: a suspended result is neither successful
+            // nor a failure. Leave success=false (the caller inspects
+            // isSuspended() separately via getResult().isSuspended()) and do
+            // NOT set `thrown` because there is no exception.
             success = getResult().isSuccess();
             if (null != getResult().getException()) {
                 thrown = getResult().getException();
@@ -125,5 +129,17 @@ public class WorkflowExecutionServiceThread
 
     public void setResult(final WorkflowExecutionResult result) {
         this.result = result;
+    }
+
+    /**
+     * Wave 2 suspend/resume: convenience accessor so {@code ExecutionJob}
+     * can detect a suspended outcome after {@code thread.join()} returns
+     * without downcasting or re-querying the result. See spec §6.1 and Wave 1
+     * in {@code docs/cycles/workflow-suspend-resume.md}.
+     *
+     * @return {@code true} if the workflow result exists and is suspended
+     */
+    public boolean isSuspended() {
+        return result != null && result.isSuspended();
     }
 }

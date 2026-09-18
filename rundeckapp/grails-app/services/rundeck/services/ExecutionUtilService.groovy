@@ -81,6 +81,109 @@ class ExecutionUtilService {
         finishExecutionMetrics(execMap)
         finishExecutionLogging(execMap)
     }
+
+    /**
+     * Wave 2 cycle/workflow-suspend-resume: tear down the thread-bound I/O
+     * and close the log writer WITHOUT firing a terminal footer, so the
+     * log file remains in a state equivalent to an in-progress execution
+     * that a future resume can reopen in append mode. See spec §4 I5 and
+     * §5.2 for the ordering contract.
+     *
+     * <p>This is the suspend-path analogue of
+     * {@link #finishExecutionLogging(ExecutionService.AsyncStarted)}. It
+     * deliberately skips the execution-XML file generation and the normal
+     * log messages that would describe a completed execution, because the
+     * execution is not completed — it is parked.
+     *
+     * <p>Wave 3 strengthens the {@code suspend()} path with an explicit
+     * fsync and a resume-mode reopen. For Wave 2 the minimum viable
+     * behavior is flush + close without footer.
+     */
+    @CompileStatic
+    def suspendExecution(ExecutionService.AsyncStarted execMap) {
+        ExecutionLogWriter loghandler = execMap?.loghandler
+        // Write an explicit [suspend] marker to the execution log BEFORE the
+        // writer is torn down, so operators have a direct trigger signal in
+        // the output view (instead of inferring it from the rule-engine's
+        // "Step N did not run" warnings).
+        if (loghandler != null) {
+            try {
+                loghandler.log(buildSuspendMarker(execMap))
+            } catch (Throwable t) {
+                log.warn("Could not write suspend marker to execution log: ${t.message}")
+            }
+        }
+        try {
+            sysThreadBoundOut.removeThreadStream()?.close()
+        } catch (Throwable t) {
+            log.warn("Could not remove thread-bound stdout on suspend: ${t.message}")
+        }
+        try {
+            sysThreadBoundErr.removeThreadStream()?.close()
+        } catch (Throwable t) {
+            log.warn("Could not remove thread-bound stderr on suspend: ${t.message}")
+        }
+        if (loghandler != null) {
+            // The ExecutionLogWriter wraps a delegate StreamingLogWriter via
+            // FilterStreamingLogWriter. Walk any filter chain to find the
+            // underlying writer that supports the suspend SPI; if none is
+            // found, fall back to plain close (which writes the footer,
+            // accepted as a v1 fallback when a third-party writer plugin
+            // does not opt in).
+            boolean suspended = findAndSuspendCheckpointableWriter(loghandler)
+            if (!suspended) {
+                log.warn("No CheckpointableStreamingLogWriter found in log writer chain; closing normally (footer will be written)")
+                try {
+                    loghandler.close()
+                } catch (Throwable t) {
+                    log.error("Failed to close log writer on suspend fallback: ${t.message}", t)
+                }
+            }
+        }
+    }
+    @CompileStatic
+    private String buildSuspendMarker(ExecutionService.AsyncStarted execMap) {
+        com.dtolabs.rundeck.core.execution.workflow.WorkflowExecutionResult result = null
+        try {
+            result = (com.dtolabs.rundeck.core.execution.workflow.WorkflowExecutionResult) execMap?.thread?.resultObject
+        } catch (Throwable ignore) {
+        }
+        List<com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest> requests =
+                result != null ? result.getSuspendRequests() : null
+        if (!requests || requests.isEmpty()) {
+            return "[suspend] Execution paused"
+        }
+        com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest primary = requests.get(0)
+        List<String> parts = new ArrayList<>()
+        String reason = primary.getReason()
+        parts << ("reason: \"" + (reason != null ? reason : 'unspecified') + '"')
+        String waitingFor = primary.getWaitingFor()
+        if (waitingFor != null && !waitingFor.isEmpty()) {
+            parts << ("waiting for: " + waitingFor)
+        }
+        long timeoutMs = primary.getTimeoutMs()
+        if (timeoutMs > 0) {
+            parts << ("timeout: " + formatDurationMs(timeoutMs))
+        }
+        return "[suspend] Execution paused \u2014 " + parts.join(', ')
+    }
+
+    @CompileStatic
+    private static String formatDurationMs(long ms) {
+        if (ms <= 0) return "0"
+        long totalSeconds = ms.intdiv(1000L)
+        long days = totalSeconds.intdiv(86400L)
+        long hours = (totalSeconds % 86400L).intdiv(3600L)
+        long minutes = (totalSeconds % 3600L).intdiv(60L)
+        long seconds = totalSeconds % 60L
+        StringBuilder sb = new StringBuilder()
+        if (days > 0) sb.append(days).append('d')
+        if (hours > 0) sb.append(hours).append('h')
+        if (minutes > 0) sb.append(minutes).append('m')
+        if (seconds > 0 && days == 0 && hours == 0) sb.append(seconds).append('s')
+        return sb.length() > 0 ? sb.toString() : (ms + "ms")
+    }
+
     @CompileStatic
     def  finishExecutionMetrics(ExecutionService.AsyncStarted execMap) {
         def ServiceThreadBase thread = execMap.thread
@@ -96,6 +199,39 @@ class ExecutionUtilService {
         // after execution.save(flush:true). See MicrometerExecutionMetricsService.recordExecution
         // call there instead.
     }
+    /**
+     * Recursively walk the log writer chain to find and suspend any
+     * CheckpointableStreamingLogWriter. Handles FilterStreamingLogWriter
+     * chains and MultiLogWriter fan-outs.
+     */
+    private boolean findAndSuspendCheckpointableWriter(com.dtolabs.rundeck.core.logging.StreamingLogWriter writer) {
+        if (writer == null) return false
+        // Check this writer
+        if (writer instanceof com.dtolabs.rundeck.core.execution.workflow.suspend.CheckpointableStreamingLogWriter) {
+            try {
+                ((com.dtolabs.rundeck.core.execution.workflow.suspend.CheckpointableStreamingLogWriter) writer).suspend()
+                return true
+            } catch (Throwable t) {
+                log.error("Failed to suspend log writer ${writer.class.name}: ${t.message}", t)
+                return false
+            }
+        }
+        // Traverse FilterStreamingLogWriter chain
+        if (writer instanceof com.dtolabs.rundeck.core.logging.FilterStreamingLogWriter) {
+            return findAndSuspendCheckpointableWriter(
+                    ((com.dtolabs.rundeck.core.logging.FilterStreamingLogWriter) writer).getWriter())
+        }
+        // Traverse MultiLogWriter fan-out
+        if (writer instanceof rundeck.services.logging.MultiLogWriter) {
+            boolean found = false
+            ((rundeck.services.logging.MultiLogWriter) writer).writers.each { w ->
+                if (findAndSuspendCheckpointableWriter(w)) found = true
+            }
+            return found
+        }
+        return false
+    }
+
     @CompileStatic
     def finishExecutionLogging(ExecutionService.AsyncStarted execMap) {
         ServiceThreadBase<WorkflowExecutionResult> thread = execMap.thread

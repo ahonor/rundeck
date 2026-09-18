@@ -25,8 +25,10 @@ package com.dtolabs.rundeck.core.execution.workflow;
 
 import com.dtolabs.rundeck.core.execution.ExceptionStatusResult;
 import com.dtolabs.rundeck.core.execution.workflow.steps.StepExecutionResult;
+import com.dtolabs.rundeck.core.execution.workflow.suspend.SuspendRequest;
 
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -50,4 +52,30 @@ public interface WorkflowExecutionResult extends ExceptionStatusResult, Workflow
      * @return map of workflow item failures, keyed by node name
      */
     public Map<Integer, StepExecutionResult> getStepFailures();
+
+    /**
+     * Whether this workflow result represents a suspended execution. When
+     * {@code true}, the overall workflow is neither successful nor failed;
+     * it has parked at a step boundary and will resume later.
+     *
+     * <p>The engine's aggregation loop sets this to {@code true} when any
+     * step in the workflow returned a {@link StepExecutionResult} with
+     * {@code isSuspended() == true}. Workflow-end listener callbacks MUST
+     * be suppressed when this is {@code true}; see spec section 6.1.
+     *
+     * <p>Default returns {@code false}, so existing implementations are
+     * unchanged.
+     */
+    default boolean isSuspended() {
+        return false;
+    }
+
+    /**
+     * Returns the list of {@link SuspendRequest}s carried by suspended steps
+     * in this workflow. For sequential workflows (the only kind supported in
+     * v1), this list has at most one entry. Default returns an empty list.
+     */
+    default List<SuspendRequest> getSuspendRequests() {
+        return Collections.emptyList();
+    }
 }

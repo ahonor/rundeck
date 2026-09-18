@@ -315,7 +315,28 @@ search
                                             <!-- /ko -->
                                         </span>
                                     </span>
+                                    %{-- Wave 6 cycle/workflow-suspend-resume: operator Pause/Resume
+                                         control alongside Kill. A single modal button whose
+                                         label, style, and click handler are driven by the
+                                         pauseControlMode computed in the KO view model, fed
+                                         from ajaxExecState every poll tick. See
+                                         docs/specs/operator-pause-resume.md §6. --}%
+                                    <span class="btn btn-sm pull-right"
+                                          style="margin-right:6px;"
+                                          data-bind="visible: pauseControlVisible(),
+                                                     css: pauseControlCss(),
+                                                     click: pauseControlAction,
+                                                     attr: { title: pauseControlTitle(),
+                                                             style: pauseControlStyle() }">
+                                        <span data-bind="text: pauseControlLabel()"></span>
+                                        <i data-bind="css: pauseControlIcon()"></i>
+                                    </span>
                                 </g:if>
+
+                                %{-- Confirmation UI is now rendered by the ConfirmUIPlugin
+                                     (confirm-plugin) via the UIPlugin SPI. No hardcoded
+                                     panel needed here. --}%
+
                             <g:if test="${scheduledExecution}">
                                     <g:if test="${authChecks[AuthConstants.ACTION_RUN] && g.executionMode(
                                             active: true,
@@ -533,7 +554,7 @@ search
                     %{--progress bar--}%
                         <div>
                             <section
-                                    data-bind="if: !completed() && !queued() && jobAverageDuration()>0">
+                                    data-bind="if: !completed() && !queued() && executionState() !== 'WAITING' && jobAverageDuration()>0">
                                 <g:set var="progressBind"
                                       value="${', css: { \'progress-bar-info\': jobPercentageFixed() < 105 ,  \'progress-bar-warning\': jobPercentageFixed() > 104  }'}"/>
                                 <g:render template="/common/progressBar"
@@ -555,6 +576,22 @@ search
                                     <div class="progress-bar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"
                                         style="width: 100%;line-height: 28px">
                                         Queued
+                                    </div>
+                                </div>
+                            </section>
+                            %{-- Wave 6 cycle/workflow-suspend-resume: when the execution is
+                                 parked waiting for operator resume (or for a confirm step),
+                                 show a static orange bar so the page no longer looks like the
+                                 job is actively running. The label distinguishes the two
+                                 waiting variants. See docs/specs/operator-pause-resume.md §6.4. --}%
+                            <section data-bind="if: executionState() === 'WAITING'">
+                                <div class="progress" style="height: 28px">
+                                    <div class="progress-bar progress-bar-warning" role="progressbar"
+                                         aria-valuenow="100" aria-valuemin="0" aria-valuemax="100"
+                                         style="width: 100%; line-height: 28px;">
+                                        <span data-bind="text: suspendType() === 'operator-pause'
+                                                              ? 'Paused by operator'
+                                                              : 'Waiting for confirmation'"></span>
                                     </div>
                                 </div>
                             </section>
